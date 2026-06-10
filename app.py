@@ -9,6 +9,16 @@ shutil.rmtree(os.path.join(os.path.dirname(os.path.abspath(__file__)), "__pycach
 
 import streamlit as st
 
+# On Streamlit Cloud there is no .env file; keys come from the app's Secrets.
+# Copy any secrets into the environment so DealsTracker (which reads os.environ)
+# works unchanged both locally (.env) and when deployed.
+try:
+    for _k in ("GROQ_API_KEY", "GOOGLE_PLACES_API_KEY"):
+        if _k in st.secrets:
+            os.environ[_k] = st.secrets[_k]
+except Exception:
+    pass  # no secrets.toml locally — .env handles it instead
+
 from DealsTracker import find_clothing_stores, get_store_deals
 
 st.set_page_config(page_title="DealsTracker", page_icon="🛍️", layout="centered")
