@@ -1,0 +1,92 @@
+from playwright.sync_api import sync_playwright
+import time
+import pandas as pd
+results = []
+url = "api.nike.com/discover/product_wall/v1"
+
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    #height = page.evaluate("document.body.scrollHeight")
+    #page.goto("https://www.nike.com/w/mens-sale-clothing-3yaepz6ymx6")
+    #print(height)
+    
+    #print(height)
+    def scroll_page():
+      og_height = 0
+      while True:
+        page.evaluate("window.scrollBy(0, 1500)")
+        page.wait_for_timeout(500)
+        height = page.evaluate("window.scrollY")
+
+        print(f"height: {height}, og height {og_height}")
+        if height == og_height:
+            break
+        og_height=height
+
+
+
+    def find_response(resp):
+        if url in resp.url:
+            print("found3434")
+            productData = resp.json()
+            #print(productData)
+
+            for group in productData["productGroupings"]:
+                for product in group["products"]:
+                    title = product["copy"]["title"]
+                    subtitle = product["copy"]["subTitle"]
+                    current_price = product["prices"]["currentPrice"]
+                    initial_price = product["prices"]["initialPrice"]
+                    discount = product["prices"]["discountPercentage"]
+
+                    color_label = product.get("displayColors", {}).get("simpleColor", {}).get("label")
+                    color_hex = product.get("displayColors", {}).get("simpleColor", {}).get("hex")
+                    color_description = product.get("displayColors", {}).get("colorDescription")
+
+                    results.append({
+                        "name": title,
+                        "subtitle": subtitle,          # e.g. "Men's Dri-FIT French Terry Pullover Fitness Hoodie"
+                        "price": current_price,
+                        "original_price": initial_price,
+                        "discount_percent": discount,
+
+                        # color — now much more detailed
+                        "color_label": color_label,            # e.g. "Black"
+                        "color_hex": color_hex,                # e.g. "27292B"
+                        "color_description": color_description, # e.g. "Black/Black/White"
+
+                        # product code is unique per colorway, great identifier
+                        "product_code": product.get("productCode"),   # e.g. "FV9919-010"
+                        "product_type": product.get("productType"),   # APPAREL or FOOTWEAR
+                        "group_key": product.get("groupKey"),         # groups colorways of same shoe together
+
+                        # ids
+                        "global_product_id": product.get("globalProductId"),
+                        "internal_pid": product.get("internalPid"),
+                        "merch_product_id": product.get("merchProductId"),
+
+                        # badges
+                        "badge": product.get("badgeLabel"),           # e.g. "Best Seller", "Recycled Materials"
+
+                        # url
+                        "pdp_url": product.get("pdpUrl", {}).get("url"),
+
+                        "is_on_sale": discount > 0,
+                    })
+            
+
+    
+
+    page.on("response", find_response)
+
+    page.goto("https://www.nike.com/w/mens-sale-clothing-3yaepz6ymx6")
+    scroll_page()
+    page.wait_for_timeout(20000)
+
+    browser.close()
+
+df=pd.DataFrame(results)
+print(df)
+df.to_csv("data.csv", index=False)
