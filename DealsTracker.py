@@ -12,7 +12,7 @@ import uniqloScraper
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY")
+GOOGLE_PLACES_API_KEY = (os.environ.get("GOOGLE_PLACES_API_KEY") or "").strip().strip('"\'')
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY not set in .env (get one at console.groq.com)")
@@ -54,7 +54,11 @@ def find_clothing_stores(city):
     }
     res = requests.post(url, headers=headers, json=body, timeout=15)
     if not res.ok:
-        raise RuntimeError(f"Places API {res.status_code}: {res.text}")
+        # Show a fingerprint of the key in use (never the full key) so a
+        # mismatched deploy secret is easy to spot.
+        k = GOOGLE_PLACES_API_KEY
+        raise RuntimeError(f"Places API {res.status_code} (key len={len(k)}, "
+                           f"ends ...{k[-4:]}): {res.text}")
     stores = []
     for place in res.json().get("places", []):
         website = place.get("websiteUri")
