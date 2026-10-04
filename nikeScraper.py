@@ -46,8 +46,17 @@ def _collect(max_items=None, full_scroll=False):
                         "pdp_url": (prod.get("pdpUrl") or {}).get("url"),
                     })
 
+    # On Streamlit Cloud, Chromium comes from apt (packages.txt) rather than
+    # `playwright install`, so point Playwright at it when it exists.
+    import os, shutil
+    system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+    launch_args = {"headless": True}
+    if system_chromium and os.name != "nt":
+        launch_args["executable_path"] = system_chromium
+        launch_args["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(**launch_args)
         try:
             page = browser.new_page(user_agent=BROWSER_UA)
             page.on("response", on_response)
