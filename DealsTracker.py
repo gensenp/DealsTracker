@@ -1,13 +1,15 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import time
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, APIConnectionError, AuthenticationError, PermissionDeniedError
 
 import nikeScraper
 import uniqloScraper
+import platformScrapers
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -19,26 +21,39 @@ if not GROQ_API_KEY:
 if not GOOGLE_PLACES_API_KEY:
     raise RuntimeError("GOOGLE_PLACES_API_KEY not set in .env (get one at console.cloud.google.com)")
 
-client = Groq(api_key=GROQ_API_KEY)
+# The SDK defaults to a 60s timeout with retries, so an unreachable API costs
+# minutes before it reports failure. Promos are a nice-to-have next to the
+# markdowns we parse ourselves, so fail fast instead.
+client = Groq(api_key=GROQ_API_KEY, timeout=20.0, max_retries=1)
 
-def ask_groq(text, url):
+def ask_groq(text, url, today=None):
+    """Ask the model for storewide promotions only.
+
+    Individual markdowns are read straight out of the markup by
+    platformScrapers, which is exact and has no length limit, so the model's job
+    is narrowed to the thing it is actually better at: banner and coupon copy.
+    That also lets us send a much smaller slice of text, so the promo wording no
+    longer competes with thousands of product prices for the context budget."""
+    today = today or time.strftime("%Y-%m-%d")
     res = client.chat.completions.create(
         model="openai/gpt-oss-120b",
-        messages=[{"role": "user", "content": f"""You are looking at a clothing store web page: {url}
+        messages=[{"role": "user", "content": f"""You are reading banner and offer text from a clothing store site: {url}
+Today's date is {today}.
 
-List every deal, discount, or sale item on the page. ALL of these count as deals:
-- Storewide / category promotions (e.g. "20% off jeans", "buy one get one free", "free shipping over $50")
-- Coupon or promo codes
-- Individual items marked down: any item whose sale price is below its regular/original price, or labeled "Final sale", "Clearance", or "Save $X"
+List only storewide or category-wide promotions, such as "40% off everything",
+"20% off jeans", "buy one get one free", "free shipping over $50", or coupon
+codes. Do not list individual product prices; those are collected separately.
 
-For marked-down items, give the item name with both prices, e.g. "Hazel Bubble Top — $68 (was $138)".
+Ignore any offer whose stated end date is before today — these pages often keep
+expired coupons online. If an offer has no date, assume it is current.
 
-If there are genuinely no deals or sale items anywhere on the page, reply with exactly: No deals found
+Reply with one short line per promotion, and nothing else. If there are no
+current storewide promotions, reply with exactly: No deals found
 
-Web page text:
-{text[:20000]}"""}]
+Page text:
+{text[:8000]}"""}]
     )
-    return res.choices[0].message.content
+    return (res.choices[0].message.content or "").strip()
 
 def find_clothing_stores(city):
     url = "https://places.googleapis.com/v1/places:searchText"
@@ -71,73 +86,178 @@ def find_clothing_stores(city):
         })
     return stores
 
-def find_deals_page(base_url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    # Ordered strongest -> weakest deal signal; we return the highest-ranked match
-    # so e.g. a "Current Promotions" link wins over an incidental keyword elsewhere.
-    keywords = ["clearance", "promotion", "promo", "deal", "sale",
-                "coupon", "special", "discount", "offer", "event"]
+# Deal-page candidates, strongest signal first. Tier 0 is the actual markdown
+# catalog ("shop all sale"), which is what we want to parse for items; promo-code
+# pages rank last because chains leave them up long after the offer expires
+# (loft.com's /sale/current-offers/ still served codes that ended in 2023).
+PAGE_TIERS = [
+    # "…/sale/shop-all", and Anthropologie's flatter "/sale-all"
+    re.compile(r"(sale|clearance).*(shop[-_]?all|view[-_]?all|all[-_]?sale)"
+               r"|/(sale|clearance)[-_]all"),
+    re.compile(r"/(sale|clearance|outlet|markdowns?)(/|$|\?)"),
+    re.compile(r"sale|clearance|outlet|markdown"),
+    re.compile(r"deal|discount|special"),
+    re.compile(r"promo|offer|coupon"),
+]
+SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "#")
+
+
+def find_deal_pages(base_url, limit=3, html=None):
+    """Return up to `limit` candidate deal-page URLs on the store's own domain,
+    best first.
+
+    The old version kept a single best match and broke ties by DOM order, which
+    on loft.com meant picking the promo-code page out of 33 links that all tied
+    on "sale" -- the real sale catalog was never visited. We now score on the URL
+    path (more reliable than link text), keep several candidates, and skip
+    mailto:/tel: links, which otherwise matched on substrings like
+    "directsales@...".
+    """
     try:
-        res = requests.get(base_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        best, best_rank = None, len(keywords)
-        for link in soup.find_all("a", href=True):
-            href = link["href"].lower()
-            text = link.text.lower()
-            for rank, k in enumerate(keywords):
-                if k in href or k in text:
-                    if rank < best_rank:
-                        best, best_rank = urljoin(base_url, link["href"]), rank
-                    break
-        return best
+        if html is None:
+            res = requests.get(base_url, headers={"User-Agent": platformScrapers.UA},
+                               timeout=10)
+            html = res.text
+        soup = BeautifulSoup(html, "html.parser")
     except Exception:
-        pass
-    return None
+        return []
+
+    host = urlparse(base_url).netloc.lower().removeprefix("www.")
+    scored, seen = [], set()
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+        if not href or href.lower().startswith(SKIP_SCHEMES):
+            continue
+        full = urljoin(base_url, href)
+        if urlparse(full).scheme not in ("http", "https"):
+            continue
+        if urlparse(full).netloc.lower().removeprefix("www.") != host:
+            continue  # stay on the store's own site
+        full = full.split("#")[0]
+        if full in seen:
+            continue
+        seen.add(full)
+
+        path = urlparse(full).path.lower()
+        text = link.get_text(" ", strip=True).lower()
+        for tier, pattern in enumerate(PAGE_TIERS):
+            if pattern.search(path):
+                scored.append((tier, full))
+                break
+            # Link text is a weaker signal than the path, so a text-only match
+            # sorts below any path match at the same tier.
+            if pattern.search(text):
+                scored.append((tier + 0.5, full))
+                break
+
+    scored.sort(key=lambda ts: ts[0])
+    return [url for _, url in scored[:limit]]
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-def render_text(url, timeout_ms=45000):
-    """Render a JavaScript-heavy page in a headless browser and return its
-    visible text. Used as a fallback when plain requests gets a blank shell
-    (e.g. React/SPA sites like Nordstrom). Imported lazily so the module still
-    works if Playwright isn't installed."""
+# Some chains reject headless Chromium specifically, whatever user agent or
+# navigator patching it presents -- anthropologie.com answers headless (both the
+# old and new modes) with a 1.5KB 403 but serves a real browser 1.5MB. Running
+# headful gets through, at the cost of a visible window locally and a virtual
+# display (xvfb) when deployed, so it is opt-in.
+HEADFUL = os.environ.get("DEALSTRACKER_HEADFUL") == "1"
+
+
+def render_html(url, timeout_ms=45000, headful=False):
+    """Render a JavaScript-heavy page in a browser and return its HTML. Used as
+    a fallback when plain requests gets a blank shell (e.g. React/SPA sites like
+    Nordstrom). Imported lazily so the module still works if Playwright isn't
+    installed.
+
+    Returns markup rather than visible text so the caller can still parse
+    product tiles out of it -- the old text-only version meant JS-rendered
+    stores lost every markdown and fell back to promo detection alone."""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=not headful)
         try:
-            page = browser.new_page(user_agent=BROWSER_UA)
+            # A plausible context matters to the cheaper bot checks: a bare
+            # headless page advertises navigator.webdriver and a 800x600 viewport.
+            context = browser.new_context(user_agent=BROWSER_UA, locale="en-US",
+                                          viewport={"width": 1440, "height": 900})
+            context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             for _ in range(6):  # scroll to trigger lazy-loaded content
                 page.evaluate("window.scrollBy(0, 1500)")
                 page.wait_for_timeout(500)
             page.wait_for_timeout(1500)
-            return page.inner_text("body")
+            return page.content()
         finally:
             browser.close()
 
-def scrape_and_clean(url):
+# Short pages that are really bot walls or error stubs. These used to slip past
+# the old length check (H&M/Levi's/Madewell all return ~210-char "Access Denied"
+# bodies, just over the 200-char threshold) and get summarized as "no deals".
+BLOCK_MARKERS = ("access denied", "forbidden", "are you a human", "unusual traffic",
+                 "enable javascript", "enable js", "bot detection", "request blocked",
+                 "pardon our interruption", "disable any ad blocker")
+
+
+def fetch_page(url, timeout=15):
+    """Fetch a page and return its HTML, falling back to a headless browser for
+    JS-rendered shells. Raises on failure so callers can report why a store came
+    back empty instead of silently reporting 'No deals found'."""
     try:
-        text = ""
+        res = requests.get(url, headers={"User-Agent": platformScrapers.UA},
+                           timeout=timeout)
+        html = res.text if res.status_code < 400 else ""
+        status = res.status_code
+    except requests.RequestException as e:
+        html, status = "", type(e).__name__
+
+    if html and not _looks_blocked(html):
+        return html
+
+    # Blank shell, bot wall, or an outright 403/429 -> retry in a browser, which
+    # runs the JS challenge these sites gate on. H&M, Levi's and Madewell all
+    # refuse plain requests this way.
+    try:
+        rendered = render_html(url)
+    except Exception as e:
+        raise RuntimeError(f"HTTP {status}, browser fallback failed "
+                           f"({type(e).__name__})") from e
+    if not _looks_blocked(rendered):
+        return rendered
+
+    # Still walled. Chains like Anthropologie reject headless Chromium itself,
+    # so a real window is the only way in -- opt in with DEALSTRACKER_HEADFUL=1.
+    if HEADFUL:
         try:
-            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            if res.ok:
-                soup = BeautifulSoup(res.text, "html.parser")
-                for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                    tag.decompose()
-                text = soup.get_text(separator=" ", strip=True)
-        except requests.RequestException:
-            pass
-        # Blank shell (JS-rendered) or blocked -> render in a real browser.
-        if len(text) < 200:
-            text = render_text(url)
-        # Still nothing readable (bot-walled chain, dead page) -> treat as no
-        # deals rather than surfacing an error to the user.
-        if len(text.strip()) < 50:
-            return "No deals found"
-        return ask_groq(text, url)
-    except Exception:
-        return "No deals found"
+            rendered = render_html(url, headful=True)
+        except Exception as e:
+            raise RuntimeError(f"blocked by bot protection, headful retry "
+                               f"failed ({type(e).__name__})") from e
+        if not _looks_blocked(rendered):
+            return rendered
+    raise RuntimeError("blocked by bot protection"
+                       + ("" if HEADFUL else " (set DEALSTRACKER_HEADFUL=1 to retry "
+                                             "walled sites in a real browser)"))
+
+
+def _looks_blocked(html):
+    """True if the markup is a bot wall or an empty shell rather than a page."""
+    body = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    return len(body) < 400 or any(m in body[:2000].lower() for m in BLOCK_MARKERS)
+
+
+def page_text(html):
+    """Visible text for promo detection.
+
+    Unlike the old cleaner this keeps <header> and <nav>: sitewide promos live
+    in the announcement bar, so stripping those tags threw away most of what we
+    were trying to find (on an Everlane sale page, 66 of 85 deal phrases)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
 
 # Per-chain scraper plugins, keyed by website domain. A chain with an
 # accessible API/feed gets a custom scraper here for cleaner, structured data;
@@ -148,20 +268,109 @@ CUSTOM_SCRAPERS = {
 }
 
 def get_store_deals(store):
-    """Get deal text for one store. Tries a registered per-chain plugin first
-    (matched on the website's domain), otherwise uses the generic pipeline.
-    Returns a deal-summary string, or 'No deals found'."""
-    host = urlparse(store.get("website", "")).netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
+    """Get deal text for one store.
+
+    Order of attack:
+      1. a per-chain plugin, if one is registered for this domain
+      2. the Shopify product feed, if the site runs on Shopify
+      3. parse markdown tiles out of the store's sale pages
+      4. ask the model about storewide promos in the page's banner text
+
+    Steps 3 and 4 are complementary -- a store can have both "40% off
+    everything" and a rack of marked-down items -- so both are reported.
+    Returns a deal-summary string, 'No deals found', or 'Error: ...'."""
+    website = store.get("website", "")
+    host = urlparse(website).netloc.lower().removeprefix("www.")
     for domain, scraper in CUSTOM_SCRAPERS.items():
         if host == domain or host.endswith("." + domain):
             try:
                 return scraper(store)
-            except Exception:
-                return "No deals found"
-    target_url = find_deals_page(store["website"]) or store["website"]
-    return scrape_and_clean(target_url)
+            except Exception as e:
+                return f"Error: {domain} scraper failed ({type(e).__name__})"
+
+    try:
+        home_html = fetch_page(website)
+    except Exception as e:
+        return f"Error: could not load site ({type(e).__name__}: {str(e)[:80]})"
+
+    # Ranked sale-page candidates double as Shopify collection hints below.
+    pages = find_deal_pages(website, html=home_html)
+
+    if platformScrapers.detect_platform(home_html) == "shopify":
+        handles = [m.group(1) for m in
+                   (re.search(r"/collections/([^/?#]+)", p) for p in pages) if m]
+        items = platformScrapers.shopify_sale(website, handles=handles)
+        if items:
+            summary = platformScrapers.summarize_items(items, label="Sale")
+            promos, _ = _promo_text(home_html, website)
+            return "\n".join(filter(None, [promos, summary]))
+
+    # Walk the best few sale pages and pool their markdowns. Visiting more than
+    # one matters: a chain's "shop all sale" page holds the items while its
+    # promo page holds the codes.
+    items, errors = [], []
+    for url in pages:
+        try:
+            html = fetch_page(url)
+        except Exception as e:
+            errors.append(f"{type(e).__name__} on {url}")
+            continue
+        items.extend(platformScrapers.parse_markdown_tiles(BeautifulSoup(html, "html.parser")))
+        if items:
+            break  # first page with real markdowns is enough
+
+    summary = platformScrapers.summarize_items(items, label="Sale")
+    promos, promo_error = _promo_text(home_html, website)
+    combined = "\n".join(filter(None, [promos, summary]))
+    if combined:
+        return combined
+    # Nothing found -- say why, so a bot wall or a broken API key is
+    # distinguishable from a store that genuinely has no sale on.
+    if promo_error:
+        return f"Error: {promo_error}"
+    if errors:
+        return f"Error: {errors[0]}"
+    return "No deals found"
+
+
+# Failures that will hit every remaining store, not just this one: a blocked
+# network (corporate firewalls often filter AI API domains) or a bad key. Once
+# we see one, stop calling the API for a while -- otherwise a scan of 20 stores
+# pays 20 connection timeouts to learn the same thing. The cooldown expires on
+# its own, so the app recovers without a restart when the network changes.
+PROMO_FATAL_ERRORS = (APIConnectionError, AuthenticationError, PermissionDeniedError)
+PROMO_COOLDOWN_SECONDS = 300
+_promo_cooldown_until = 0.0
+_promo_cooldown_reason = ""
+
+
+def _promo_text(home_html, url):
+    """Storewide promos from the homepage banner.
+
+    Returns (promos, error), either of which may be None. The error is kept
+    separate so a failed model call (an unreachable API, a rate limit) doesn't
+    get glued onto an otherwise good list of markdowns -- but is still available
+    to report when there is nothing else to show."""
+    global _promo_cooldown_until, _promo_cooldown_reason
+    if time.monotonic() < _promo_cooldown_until:
+        return None, _promo_cooldown_reason
+
+    try:
+        text = page_text(home_html)
+        if len(text.strip()) < 50:
+            return None, "page had no readable text"
+        promos = ask_groq(text, url)
+    except PROMO_FATAL_ERRORS as e:
+        _promo_cooldown_until = time.monotonic() + PROMO_COOLDOWN_SECONDS
+        _promo_cooldown_reason = (f"promo lookup unavailable ({type(e).__name__}) -- "
+                                  f"skipping promos for the next "
+                                  f"{PROMO_COOLDOWN_SECONDS // 60} min")
+        return None, _promo_cooldown_reason
+    except Exception as e:
+        return None, f"promo lookup failed ({type(e).__name__})"
+    if not promos or "no deals found" in promos.lower():
+        return None, None
+    return promos, None
 
 if __name__ == "__main__":
     city = "San Jose"
