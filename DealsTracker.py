@@ -87,7 +87,9 @@ def find_clothing_stores(city):
 # pages rank last because chains leave them up long after the offer expires
 # (loft.com's /sale/current-offers/ still served codes that ended in 2023).
 PAGE_TIERS = [
-    re.compile(r"(sale|clearance).*(shop[-_]?all|view[-_]?all|all[-_]?sale)"),
+    # "…/sale/shop-all", and Anthropologie's flatter "/sale-all"
+    re.compile(r"(sale|clearance).*(shop[-_]?all|view[-_]?all|all[-_]?sale)"
+               r"|/(sale|clearance)[-_]all"),
     re.compile(r"/(sale|clearance|outlet|markdowns?)(/|$|\?)"),
     re.compile(r"sale|clearance|outlet|markdown"),
     re.compile(r"deal|discount|special"),
@@ -148,22 +150,36 @@ def find_deal_pages(base_url, limit=3, html=None):
     return [url for _, url in scored[:limit]]
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-def render_html(url, timeout_ms=45000):
-    """Render a JavaScript-heavy page in a headless browser and return its HTML.
-    Used as a fallback when plain requests gets a blank shell (e.g. React/SPA
-    sites like Nordstrom). Imported lazily so the module still works if
-    Playwright isn't installed.
+# Some chains reject headless Chromium specifically, whatever user agent or
+# navigator patching it presents -- anthropologie.com answers headless (both the
+# old and new modes) with a 1.5KB 403 but serves a real browser 1.5MB. Running
+# headful gets through, at the cost of a visible window locally and a virtual
+# display (xvfb) when deployed, so it is opt-in.
+HEADFUL = os.environ.get("DEALSTRACKER_HEADFUL") == "1"
+
+
+def render_html(url, timeout_ms=45000, headful=False):
+    """Render a JavaScript-heavy page in a browser and return its HTML. Used as
+    a fallback when plain requests gets a blank shell (e.g. React/SPA sites like
+    Nordstrom). Imported lazily so the module still works if Playwright isn't
+    installed.
 
     Returns markup rather than visible text so the caller can still parse
     product tiles out of it -- the old text-only version meant JS-rendered
     stores lost every markdown and fell back to promo detection alone."""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=not headful)
         try:
-            page = browser.new_page(user_agent=BROWSER_UA)
+            # A plausible context matters to the cheaper bot checks: a bare
+            # headless page advertises navigator.webdriver and a 800x600 viewport.
+            context = browser.new_context(user_agent=BROWSER_UA, locale="en-US",
+                                          viewport={"width": 1440, "height": 900})
+            context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             for _ in range(6):  # scroll to trigger lazy-loaded content
                 page.evaluate("window.scrollBy(0, 1500)")
@@ -177,8 +193,8 @@ def render_html(url, timeout_ms=45000):
 # the old length check (H&M/Levi's/Madewell all return ~210-char "Access Denied"
 # bodies, just over the 200-char threshold) and get summarized as "no deals".
 BLOCK_MARKERS = ("access denied", "forbidden", "are you a human", "unusual traffic",
-                 "enable javascript", "bot detection", "request blocked",
-                 "pardon our interruption")
+                 "enable javascript", "enable js", "bot detection", "request blocked",
+                 "pardon our interruption", "disable any ad blocker")
 
 
 def fetch_page(url, timeout=15):
@@ -193,18 +209,39 @@ def fetch_page(url, timeout=15):
     except requests.RequestException as e:
         html, status = "", type(e).__name__
 
-    body = BeautifulSoup(html, "html.parser").get_text(" ", strip=True) if html else ""
-    blocked = any(m in body[:2000].lower() for m in BLOCK_MARKERS)
-    if not html or len(body) < 400 or blocked:
-        # Blank shell, bot wall, or an outright 403/429 -> retry in a real
-        # browser, which runs the JS challenge these sites gate on. H&M,
-        # Levi's and Madewell all refuse plain requests this way.
+    if html and not _looks_blocked(html):
+        return html
+
+    # Blank shell, bot wall, or an outright 403/429 -> retry in a browser, which
+    # runs the JS challenge these sites gate on. H&M, Levi's and Madewell all
+    # refuse plain requests this way.
+    try:
+        rendered = render_html(url)
+    except Exception as e:
+        raise RuntimeError(f"HTTP {status}, browser fallback failed "
+                           f"({type(e).__name__})") from e
+    if not _looks_blocked(rendered):
+        return rendered
+
+    # Still walled. Chains like Anthropologie reject headless Chromium itself,
+    # so a real window is the only way in -- opt in with DEALSTRACKER_HEADFUL=1.
+    if HEADFUL:
         try:
-            return render_html(url)
+            rendered = render_html(url, headful=True)
         except Exception as e:
-            raise RuntimeError(f"HTTP {status}, browser fallback failed "
-                               f"({type(e).__name__})") from e
-    return html
+            raise RuntimeError(f"blocked by bot protection, headful retry "
+                               f"failed ({type(e).__name__})") from e
+        if not _looks_blocked(rendered):
+            return rendered
+    raise RuntimeError("blocked by bot protection"
+                       + ("" if HEADFUL else " (set DEALSTRACKER_HEADFUL=1 to retry "
+                                             "walled sites in a real browser)"))
+
+
+def _looks_blocked(html):
+    """True if the markup is a bot wall or an empty shell rather than a page."""
+    body = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    return len(body) < 400 or any(m in body[:2000].lower() for m in BLOCK_MARKERS)
 
 
 def page_text(html):
