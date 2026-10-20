@@ -97,8 +97,17 @@ PAGE_TIERS = [
 ]
 SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "#")
 
+# Used only when a site links no sale page at all. Small boutiques often have a
+# single storefront page whose markdowns are visible but never advertised as a
+# "sale" -- finaltouchwithclass.com keeps its half-price rack under
+# "/merchandise" with the word "sale" nowhere in the markup.
+STORE_TIERS = [
+    re.compile(r"/(shop|store|merchandise|products|collections|boutique)(/|$|\?)"),
+    re.compile(r"shop|store|merchandise|product|boutique|catalog"),
+]
 
-def find_deal_pages(base_url, limit=3, html=None):
+
+def find_deal_pages(base_url, limit=3, html=None, patterns=None):
     """Return up to `limit` candidate deal-page URLs on the store's own domain,
     best first.
 
@@ -136,7 +145,7 @@ def find_deal_pages(base_url, limit=3, html=None):
 
         path = urlparse(full).path.lower()
         text = link.get_text(" ", strip=True).lower()
-        for tier, pattern in enumerate(PAGE_TIERS):
+        for tier, pattern in enumerate(patterns or PAGE_TIERS):
             if pattern.search(path):
                 scored.append((tier, full))
                 break
@@ -160,7 +169,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HEADFUL = os.environ.get("DEALSTRACKER_HEADFUL") == "1"
 
 
-def render_html(url, timeout_ms=45000, headful=False):
+def render_html(url, timeout_ms=45000, headful=False, user_agent=BROWSER_UA):
     """Render a JavaScript-heavy page in a browser and return its HTML. Used as
     a fallback when plain requests gets a blank shell (e.g. React/SPA sites like
     Nordstrom). Imported lazily so the module still works if Playwright isn't
@@ -175,7 +184,7 @@ def render_html(url, timeout_ms=45000, headful=False):
         try:
             # A plausible context matters to the cheaper bot checks: a bare
             # headless page advertises navigator.webdriver and a 800x600 viewport.
-            context = browser.new_context(user_agent=BROWSER_UA, locale="en-US",
+            context = browser.new_context(user_agent=user_agent, locale="en-US",
                                           viewport={"width": 1440, "height": 900})
             context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
@@ -215,27 +224,44 @@ def fetch_page(url, timeout=15):
     # Blank shell, bot wall, or an outright 403/429 -> retry in a browser, which
     # runs the JS challenge these sites gate on. H&M, Levi's and Madewell all
     # refuse plain requests this way.
-    try:
-        rendered = render_html(url)
-    except Exception as e:
-        raise RuntimeError(f"HTTP {status}, browser fallback failed "
-                           f"({type(e).__name__})") from e
-    if not _looks_blocked(rendered):
+    rendered, last_error = render_any_ua(url)
+    if rendered is not None and not _looks_blocked(rendered):
         return rendered
+    if rendered is None:
+        raise RuntimeError(f"HTTP {status}, browser fallback failed "
+                           f"({type(last_error).__name__})") from last_error
 
     # Still walled. Chains like Anthropologie reject headless Chromium itself,
     # so a real window is the only way in -- opt in with DEALSTRACKER_HEADFUL=1.
     if HEADFUL:
-        try:
-            rendered = render_html(url, headful=True)
-        except Exception as e:
+        rendered, last_error = render_any_ua(url, headful=True)
+        if rendered is None:
             raise RuntimeError(f"blocked by bot protection, headful retry "
-                               f"failed ({type(e).__name__})") from e
+                               f"failed ({type(last_error).__name__})") from last_error
         if not _looks_blocked(rendered):
             return rendered
     raise RuntimeError("blocked by bot protection"
                        + ("" if HEADFUL else " (set DEALSTRACKER_HEADFUL=1 to retry "
                                              "walled sites in a real browser)"))
+
+
+def render_any_ua(url, headful=False):
+    """Render `url`, trying the browser-like user agent and then the sparse one.
+
+    Returns (html, error); html is the first response that isn't a wall, or the
+    last one received if all of them were. Some hosts block the browser-like
+    string and serve the bare one -- finaltouchwithclass.com 403s a Chrome UA in
+    the browser while answering "Mozilla/5.0" with the full page."""
+    rendered, last_error = None, None
+    for ua in (BROWSER_UA, platformScrapers.UA):
+        try:
+            rendered = render_html(url, headful=headful, user_agent=ua)
+        except Exception as e:
+            last_error = e
+            continue
+        if not _looks_blocked(rendered):
+            return rendered, None
+    return rendered, last_error
 
 
 def _looks_blocked(html):
@@ -291,6 +317,8 @@ def get_store_deals(store):
 
     # Ranked sale-page candidates double as Shopify collection hints below.
     pages = find_deal_pages(website, html=home_html)
+    if not pages:
+        pages = find_deal_pages(website, html=home_html, patterns=STORE_TIERS)
 
     if platformScrapers.detect_platform(home_html) == "shopify":
         handles = [m.group(1) for m in
@@ -304,14 +332,25 @@ def get_store_deals(store):
     # Walk the best few sale pages and pool their markdowns. Visiting more than
     # one matters: a chain's "shop all sale" page holds the items while its
     # promo page holds the codes.
-    items, errors = [], []
+    items, errors, escalated = [], [], False
     for url in pages:
         try:
             html = fetch_page(url)
         except Exception as e:
             errors.append(f"{type(e).__name__} on {url}")
             continue
-        items.extend(platformScrapers.parse_markdown_tiles(BeautifulSoup(html, "html.parser")))
+        found = platformScrapers.parse_markdown_tiles(BeautifulSoup(html, "html.parser"))
+        if not found and not escalated and platformScrapers.has_storefront(html):
+            # The page loaded fine but held no tiles, which is what an embedded
+            # storefront looks like before its JS runs. Render once -- bounded to
+            # a single page, and only where the markup actually references a
+            # store, so brochure sites aren't rendered for nothing.
+            escalated = True
+            rendered, _ = render_any_ua(url)
+            if rendered:
+                found = platformScrapers.parse_markdown_tiles(
+                    BeautifulSoup(rendered, "html.parser"))
+        items.extend(found)
         if items:
             break  # first page with real markdowns is enough
 

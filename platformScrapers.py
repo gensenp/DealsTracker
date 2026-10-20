@@ -70,6 +70,20 @@ def _money(text):
         return None
 
 
+# Embedded storefronts that may inject their product grid client-side. Used to
+# decide whether a page with no parseable tiles is worth re-fetching in a
+# browser, so brochure sites with no shop at all aren't rendered for nothing.
+STOREFRONT_MARKERS = ("ecwid", "shopify", "bigcommerce", "snipcart", "squarespace",
+                      "wix-stores", "woocommerce", "storefront", "add-to-cart",
+                      "addtocart")
+
+
+def has_storefront(html):
+    """True if the markup references an embedded store platform."""
+    low = html.lower()
+    return any(m in low for m in STOREFRONT_MARKERS)
+
+
 def detect_platform(html):
     """Identify the commerce platform from page markup, or None if unknown."""
     if "cdn.shopify.com" in html or "/cdn/shop/" in html or "Shopify.theme" in html:
@@ -130,7 +144,8 @@ def parse_markdown_tiles(soup):
     tiles = soup.select(
         '[class*="product-tile" i], [class*="producttile" i], '
         '[class*="product-card" i], [class*="productcard" i], '
-        '[class*="product-item" i], li[class*="product" i]')
+        '[class*="product-item" i], [class*="grid-product" i], '
+        '[class*="product-grid-item" i], li[class*="product" i]')
     items, seen = [], set()
     for tile in tiles:
         price_nodes = tile.select('[class*="price" i], s, del')
