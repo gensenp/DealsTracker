@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import time
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, APIConnectionError, AuthenticationError, PermissionDeniedError
 
 import nikeScraper
 import uniqloScraper
@@ -21,7 +21,10 @@ if not GROQ_API_KEY:
 if not GOOGLE_PLACES_API_KEY:
     raise RuntimeError("GOOGLE_PLACES_API_KEY not set in .env (get one at console.cloud.google.com)")
 
-client = Groq(api_key=GROQ_API_KEY)
+# The SDK defaults to a 60s timeout with retries, so an unreachable API costs
+# minutes before it reports failure. Promos are a nice-to-have next to the
+# markdowns we parse ourselves, so fail fast instead.
+client = Groq(api_key=GROQ_API_KEY, timeout=20.0, max_retries=1)
 
 def ask_groq(text, url, today=None):
     """Ask the model for storewide promotions only.
@@ -289,6 +292,17 @@ def get_store_deals(store):
     return "No deals found"
 
 
+# Failures that will hit every remaining store, not just this one: a blocked
+# network (corporate firewalls often filter AI API domains) or a bad key. Once
+# we see one, stop calling the API for a while -- otherwise a scan of 20 stores
+# pays 20 connection timeouts to learn the same thing. The cooldown expires on
+# its own, so the app recovers without a restart when the network changes.
+PROMO_FATAL_ERRORS = (APIConnectionError, AuthenticationError, PermissionDeniedError)
+PROMO_COOLDOWN_SECONDS = 300
+_promo_cooldown_until = 0.0
+_promo_cooldown_reason = ""
+
+
 def _promo_text(home_html, url):
     """Storewide promos from the homepage banner.
 
@@ -296,11 +310,21 @@ def _promo_text(home_html, url):
     separate so a failed model call (an unreachable API, a rate limit) doesn't
     get glued onto an otherwise good list of markdowns -- but is still available
     to report when there is nothing else to show."""
+    global _promo_cooldown_until, _promo_cooldown_reason
+    if time.monotonic() < _promo_cooldown_until:
+        return None, _promo_cooldown_reason
+
     try:
         text = page_text(home_html)
         if len(text.strip()) < 50:
             return None, "page had no readable text"
         promos = ask_groq(text, url)
+    except PROMO_FATAL_ERRORS as e:
+        _promo_cooldown_until = time.monotonic() + PROMO_COOLDOWN_SECONDS
+        _promo_cooldown_reason = (f"promo lookup unavailable ({type(e).__name__}) -- "
+                                  f"skipping promos for the next "
+                                  f"{PROMO_COOLDOWN_SECONDS // 60} min")
+        return None, _promo_cooldown_reason
     except Exception as e:
         return None, f"promo lookup failed ({type(e).__name__})"
     if not promos or "no deals found" in promos.lower():
