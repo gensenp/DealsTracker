@@ -90,8 +90,19 @@ def find_clothing_stores(city, state=None, postal_code=None):
 
 # Ordered strongest -> weakest deal signal; we return the highest-ranked match
 # so e.g. a "Current Promotions" link wins over an incidental keyword elsewhere.
-DEAL_KEYWORDS = ["clearance", "promotion", "promo", "deal", "sale",
+# "clearance"/"sale" name an actual catalog section, while "deal"/"promo" tend
+# to label partner or campaign pages (H&M files a student-discount offer under
+# /home/deals/), so they rank lower.
+DEAL_KEYWORDS = ["clearance", "sale", "promotion", "promo", "deal",
                  "coupon", "special", "discount", "offer", "event"]
+
+# Keywords good enough to stop hunting: a real sale section, not a campaign page.
+_STRONG_RANK = 1
+
+# Markers for the "everything in this section" page. Without this we'd happily
+# take H&M's /men/sale/pants.html over its /men/sale/view-all.html and report
+# only the trousers on sale.
+_BROAD_PATTERN = re.compile(r"(?<![a-z])(view[-_]?all|shop[-_]?all|all)(?![a-z])")
 
 # Whole-word (optionally plural) matching, so "wholesale", "Salem" and "dealer"
 # don't register as deals. Hyphens, slashes and the "--"/"__" in BEM class names
@@ -143,11 +154,13 @@ def _rank_link(link):
                 0 if _in_nav(link) else 1,      # nav link beats banner or body link
                 rank,                           # strongest keyword
                 1 if parsed.query else 0,       # "/sale" beats "/promo-sale?html_banner=1"
+                0 if _BROAD_PATTERN.search(path) else 1,  # "view all" beats one subcategory
                 len(parsed.path),               # section root beats a subcategory
             )
     return None
 
-def _best_deal_link(html, base_url):
+def _best_deal_link_keyed(html, base_url):
+    """Best deal link in this HTML as (url, sort_key), or (None, None)."""
     soup = BeautifulSoup(html, "html.parser")
     base_host = _host(base_url)
     best, best_key = None, None
@@ -164,6 +177,49 @@ def _best_deal_link(html, base_url):
         key = _rank_link(link)
         if key is not None and (best_key is None or key < best_key):
             best, best_key = target, key
+    return best, best_key
+
+def _best_deal_link(html, base_url):
+    return _best_deal_link_keyed(html, base_url)[0]
+
+# Top-level nav items worth pointing at, and how many to try before giving up.
+_NAV_ITEM_SELECTOR = "nav a, nav button, header a, header button"
+_MAX_HOVERS = 12
+
+def _find_deal_link_rendered(base_url, timeout_ms=45000):
+    """Render the page and hunt for a deal link, hovering top-level nav items
+    if the visible nav has nothing.
+
+    Mega-menus build their submenu only once the parent is pointed at, so the
+    Sale link genuinely isn't in the DOM until then -- H&M files its sale pages
+    under Women/Men this way, and hovering "WOMEN" takes the page from 82 links
+    to over 1100."""
+    best, best_key = None, None
+    with open_page() as page:
+        page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(3000)  # let the nav hydrate
+        best, best_key = _best_deal_link_keyed(page.content(), base_url)
+        if best_key and best_key[1] <= _STRONG_RANK:
+            return best
+
+        hovered = 0
+        for item in page.query_selector_all(_NAV_ITEM_SELECTOR):
+            if hovered >= _MAX_HOVERS:
+                break
+            try:
+                if not item.is_visible():
+                    continue
+                item.hover(timeout=2500)
+                hovered += 1
+                page.wait_for_timeout(700)  # let the submenu render
+                candidate, key = _best_deal_link_keyed(page.content(), base_url)
+            except Exception:
+                continue  # element detached or moved mid-hover -- try the next
+            if key is not None and (best_key is None or key < best_key):
+                best, best_key = candidate, key
+            # A real sale section is as good as it gets; stop opening menus.
+            if best_key and best_key[1] <= _STRONG_RANK:
+                break
     return best
 
 def find_deals_page(base_url):
@@ -184,7 +240,7 @@ def find_deals_page(base_url):
     if best:
         return best
     try:
-        return _best_deal_link(render_html(base_url), base_url)
+        return _find_deal_link_rendered(base_url)
     except Exception:
         return None
 
