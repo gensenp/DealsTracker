@@ -40,7 +40,22 @@ Web page text:
     )
     return res.choices[0].message.content
 
-def find_clothing_stores(city):
+def build_location(city, state=None, postal_code=None):
+    """Join the location parts into the form Places understands best:
+    "San Jose, CA 95113". Any part may be blank -- a bare ZIP is enough to
+    pin down a city, and a bare city still works as it always did."""
+    city = (city or "").strip()
+    state = (state or "").strip()
+    postal_code = (postal_code or "").strip()
+
+    location = ", ".join(p for p in (city, state) if p)
+    return f"{location} {postal_code}".strip() if postal_code else location
+
+def find_clothing_stores(city, state=None, postal_code=None):
+    location = build_location(city, state, postal_code)
+    if not location:
+        raise ValueError("Enter a city or a ZIP code.")
+
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
@@ -48,7 +63,7 @@ def find_clothing_stores(city):
         "X-Goog-FieldMask": "places.displayName,places.websiteUri,places.formattedAddress",
     }
     body = {
-        "textQuery": f"clothing stores in {city}",
+        "textQuery": f"clothing stores in {location}",
         "includedType": "clothing_store",
         "pageSize": 20,
     }
