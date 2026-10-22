@@ -120,6 +120,28 @@ def _host(url):
     host = urlparse(url).netloc.lower()
     return host[4:] if host.startswith("www.") else host
 
+# Multi-part public suffixes we're likely to meet, so that "foo.co.uk" and
+# "bar.co.uk" aren't mistaken for one site.
+_MULTI_PART_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+    "co.jp", "co.nz", "co.za", "com.br", "com.mx", "co.in", "com.sg",
+}
+
+def _registrable(host):
+    """The part of a hostname that identifies the site -- nordstromrack.com for
+    both www.nordstromrack.com and stores.nordstromrack.com. Chains often park
+    their store locator on a separate subdomain and link back to the main shop,
+    so comparing full hostnames would discard the very link we want."""
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    if ".".join(labels[-2:]) in _MULTI_PART_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+def _same_site(host, base_host):
+    return _registrable(host) == _registrable(base_host)
+
 def _attr_blob(link):
     parts = []
     for attr in _SIGNAL_ATTRS:
@@ -171,8 +193,7 @@ def _best_deal_link_keyed(html, base_url):
         target = urljoin(base_url, href)
         # Stay on the store's own site; outbound "deals" links are affiliate or
         # social noise.
-        host = _host(target)
-        if host != base_host and not host.endswith("." + base_host):
+        if not _same_site(_host(target), base_host):
             continue
         key = _rank_link(link)
         if key is not None and (best_key is None or key < best_key):
