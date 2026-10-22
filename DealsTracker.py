@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -6,6 +7,7 @@ import time
 from dotenv import load_dotenv
 from groq import Groq
 
+from browser import BROWSER_UA, open_page
 import nikeScraper
 import uniqloScraper
 
@@ -86,50 +88,124 @@ def find_clothing_stores(city, state=None, postal_code=None):
         })
     return stores
 
-def find_deals_page(base_url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    # Ordered strongest -> weakest deal signal; we return the highest-ranked match
-    # so e.g. a "Current Promotions" link wins over an incidental keyword elsewhere.
-    keywords = ["clearance", "promotion", "promo", "deal", "sale",
-                "coupon", "special", "discount", "offer", "event"]
-    try:
-        res = requests.get(base_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        best, best_rank = None, len(keywords)
-        for link in soup.find_all("a", href=True):
-            href = link["href"].lower()
-            text = link.text.lower()
-            for rank, k in enumerate(keywords):
-                if k in href or k in text:
-                    if rank < best_rank:
-                        best, best_rank = urljoin(base_url, link["href"]), rank
-                    break
-        return best
-    except Exception:
-        pass
+# Ordered strongest -> weakest deal signal; we return the highest-ranked match
+# so e.g. a "Current Promotions" link wins over an incidental keyword elsewhere.
+DEAL_KEYWORDS = ["clearance", "promotion", "promo", "deal", "sale",
+                 "coupon", "special", "discount", "offer", "event"]
+
+# Whole-word (optionally plural) matching, so "wholesale", "Salem" and "dealer"
+# don't register as deals. Hyphens, slashes and the "--"/"__" in BEM class names
+# all read as boundaries, which is what lets both "/on-sale" and
+# "c-pwa-header-navigation__link--sale" match.
+_KEYWORD_PATTERNS = [(rank, re.compile(rf"(?<![a-z]){re.escape(k)}s?(?![a-z])"))
+                     for rank, k in enumerate(DEAL_KEYWORDS)]
+
+# Attributes carrying the nav's own labelling of a link, e.g. Urban Outfitters'
+# class="...header-navigation__link--sale" id="l1-sale" on an otherwise plain
+# <a href="/sale"><span>Sale</span></a>.
+_SIGNAL_ATTRS = ("class", "id", "aria-label", "title", "data-qa")
+
+def _host(url):
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+def _attr_blob(link):
+    parts = []
+    for attr in _SIGNAL_ATTRS:
+        val = link.get(attr)
+        if isinstance(val, list):  # bs4 returns class as a list
+            val = " ".join(val)
+        if val:
+            parts.append(val)
+    return " ".join(parts).lower()
+
+def _in_nav(link):
+    """True if the link belongs to the site's main navigation -- either inside
+    a <nav>, or labelled as nav by its own classes. Nav links point at the real
+    section; promo banners sitting in the same header point at one-off landing
+    pages with far less on them."""
+    return bool(link.find_parent("nav")) or "nav" in _attr_blob(link)
+
+def _rank_link(link):
+    """Lowest-is-best sort key for a candidate link, or None if it shows no
+    deal signal at all."""
+    parsed = urlparse(link["href"].lower())
+    # Match the path only, never the query string: tracking params are full of
+    # words like "promo" and "offer" that have nothing to do with the target
+    # page (Gap's credit-card signup carries "..._CARD_RET_PROMO").
+    path = parsed.path
+    text = link.get_text(" ", strip=True).lower()
+    attrs = _attr_blob(link)
+
+    for rank, pattern in _KEYWORD_PATTERNS:
+        if pattern.search(path) or pattern.search(text) or pattern.search(attrs):
+            return (
+                0 if _in_nav(link) else 1,      # nav link beats banner or body link
+                rank,                           # strongest keyword
+                1 if parsed.query else 0,       # "/sale" beats "/promo-sale?html_banner=1"
+                len(parsed.path),               # section root beats a subcategory
+            )
     return None
 
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+def _best_deal_link(html, base_url):
+    soup = BeautifulSoup(html, "html.parser")
+    base_host = _host(base_url)
+    best, best_key = None, None
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        target = urljoin(base_url, href)
+        # Stay on the store's own site; outbound "deals" links are affiliate or
+        # social noise.
+        host = _host(target)
+        if host != base_host and not host.endswith("." + base_host):
+            continue
+        key = _rank_link(link)
+        if key is not None and (best_key is None or key < best_key):
+            best, best_key = target, key
+    return best
+
+def find_deals_page(base_url):
+    """Find a store's sale/deals page, starting from whatever URL Places gave
+    us -- often a store-locator page rather than the homepage. Tries a plain
+    fetch first, then a rendered one, because big chains build their nav in
+    JavaScript and turn away non-browser clients, so the <a href="/sale"> we
+    want frequently only exists once the page has run."""
+    html = ""
+    try:
+        res = requests.get(base_url, headers={"User-Agent": BROWSER_UA}, timeout=10)
+        if res.ok:
+            html = res.text
+    except requests.RequestException:
+        pass
+
+    best = _best_deal_link(html, base_url) if html else None
+    if best:
+        return best
+    try:
+        return _best_deal_link(render_html(base_url), base_url)
+    except Exception:
+        return None
+
+def render_html(url, timeout_ms=45000):
+    """Rendered DOM of a page, once its JavaScript has built the nav."""
+    with open_page() as page:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(3000)  # let the nav hydrate
+        return page.content()
 
 def render_text(url, timeout_ms=45000):
     """Render a JavaScript-heavy page in a headless browser and return its
     visible text. Used as a fallback when plain requests gets a blank shell
-    (e.g. React/SPA sites like Nordstrom). Imported lazily so the module still
-    works if Playwright isn't installed."""
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            page = browser.new_page(user_agent=BROWSER_UA)
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            for _ in range(6):  # scroll to trigger lazy-loaded content
-                page.evaluate("window.scrollBy(0, 1500)")
-                page.wait_for_timeout(500)
-            page.wait_for_timeout(1500)
-            return page.inner_text("body")
-        finally:
-            browser.close()
+    (e.g. React/SPA sites like Nordstrom)."""
+    with open_page() as page:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        for _ in range(6):  # scroll to trigger lazy-loaded content
+            page.evaluate("window.scrollBy(0, 1500)")
+            page.wait_for_timeout(500)
+        page.wait_for_timeout(1500)
+        return page.inner_text("body")
 
 def scrape_and_clean(url):
     try:

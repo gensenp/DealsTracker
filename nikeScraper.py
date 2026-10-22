@@ -10,17 +10,15 @@ Two ways to use it:
   - standalone:                `python nikeScraper.py` -> dumps full data.csv
 """
 
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 API_MARKER = "api.nike.com/discover/product_wall"
 SALE_URL = "https://www.nike.com/w/mens-sale-clothing-3yaepz6ymx6"
 
 
 def _collect(max_items=None, full_scroll=False):
     """Open the Nike sale page and intercept product-wall API responses,
-    returning a list of product dicts. Playwright is imported lazily so the
-    rest of DealsTracker still works if it isn't installed."""
-    from playwright.sync_api import sync_playwright
+    returning a list of product dicts. Playwright is imported lazily (inside
+    browser.open_page) so the rest of DealsTracker still works without it."""
+    from browser import open_page
 
     results = []
 
@@ -46,33 +44,19 @@ def _collect(max_items=None, full_scroll=False):
                         "pdp_url": (prod.get("pdpUrl") or {}).get("url"),
                     })
 
-    # On Streamlit Cloud, Chromium comes from apt (packages.txt) rather than
-    # `playwright install`, so point Playwright at it when it exists.
-    import os, shutil
-    system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
-    launch_args = {"headless": True}
-    if system_chromium and os.name != "nt":
-        launch_args["executable_path"] = system_chromium
-        launch_args["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_args)
-        try:
-            page = browser.new_page(user_agent=BROWSER_UA)
-            page.on("response", on_response)
-            page.goto(SALE_URL, wait_until="domcontentloaded", timeout=45000)
-            # Scroll to trigger the product-wall API calls. The plugin only needs
-            # a sample to summarize; the standalone dump walks the whole catalog.
-            for _ in range(60 if full_scroll else 8):
-                if max_items and len(results) >= max_items:
-                    break
-                try:
-                    page.evaluate("window.scrollBy(0, 2000)")
-                except Exception:
-                    break  # renderer hiccup -> stop with what we have
-                page.wait_for_timeout(700)
-        finally:
-            browser.close()
+    with open_page() as page:
+        page.on("response", on_response)
+        page.goto(SALE_URL, wait_until="domcontentloaded", timeout=45000)
+        # Scroll to trigger the product-wall API calls. The plugin only needs
+        # a sample to summarize; the standalone dump walks the whole catalog.
+        for _ in range(60 if full_scroll else 8):
+            if max_items and len(results) >= max_items:
+                break
+            try:
+                page.evaluate("window.scrollBy(0, 2000)")
+            except Exception:
+                break  # renderer hiccup -> stop with what we have
+            page.wait_for_timeout(700)
     return results
 
 
