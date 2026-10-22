@@ -93,8 +93,12 @@ def find_clothing_stores(city, state=None, postal_code=None):
 # "clearance"/"sale" name an actual catalog section, while "deal"/"promo" tend
 # to label partner or campaign pages (H&M files a student-discount offer under
 # /home/deals/), so they rank lower.
+# "special" and "event" are deliberately absent: in retail they catch
+# "Partywear & Special Occasions" and in-store events far more often than they
+# catch a deal, and a false hit is worse than none -- it sends the scraper off
+# to summarize a page with no prices on it.
 DEAL_KEYWORDS = ["clearance", "sale", "promotion", "promo", "deal",
-                 "coupon", "special", "discount", "offer", "event"]
+                 "coupon", "discount", "offer"]
 
 # Keywords good enough to stop hunting: a real sale section, not a campaign page.
 _STRONG_RANK = 1
@@ -207,7 +211,13 @@ def _best_deal_link(html, base_url):
 _NAV_ITEM_SELECTOR = "nav a, nav button, header a, header button"
 _MAX_HOVERS = 12
 
-def _find_deal_link_rendered(base_url, timeout_ms=45000):
+# Hovering is a last resort, and a slow site can make it crawl -- Primark spent
+# 110s working through its menus. Cap the whole rendered phase so one store
+# can't stall a search over a dozen of them; we return the best link found so
+# far when the budget runs out.
+_RENDER_BUDGET_S = 25
+
+def _find_deal_link_rendered(base_url, timeout_ms=20000):
     """Render the page and hunt for a deal link, hovering top-level nav items
     if the visible nav has nothing.
 
@@ -216,6 +226,7 @@ def _find_deal_link_rendered(base_url, timeout_ms=45000):
     under Women/Men this way, and hovering "WOMEN" takes the page from 82 links
     to over 1100."""
     best, best_key = None, None
+    deadline = time.monotonic() + _RENDER_BUDGET_S
     with open_page() as page:
         page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_timeout(3000)  # let the nav hydrate
@@ -225,7 +236,7 @@ def _find_deal_link_rendered(base_url, timeout_ms=45000):
 
         hovered = 0
         for item in page.query_selector_all(_NAV_ITEM_SELECTOR):
-            if hovered >= _MAX_HOVERS:
+            if hovered >= _MAX_HOVERS or time.monotonic() > deadline:
                 break
             try:
                 if not item.is_visible():
