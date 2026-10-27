@@ -290,7 +290,14 @@ CUSTOM_SCRAPERS = {
 }
 
 def get_store_deals(store):
-    """Get deal text for one store.
+    """Get deal text for one store. Returns a deal-summary string,
+    'No deals found', or 'Error: ...'. See collect_store_deals for the
+    structured form of the same scan."""
+    return collect_store_deals(store)["summary"]
+
+
+def collect_store_deals(store):
+    """Scan one store and return {items, promos, summary}.
 
     Order of attack:
       1. a per-chain plugin, if one is registered for this domain
@@ -300,20 +307,26 @@ def get_store_deals(store):
 
     Steps 3 and 4 are complementary -- a store can have both "40% off
     everything" and a rack of marked-down items -- so both are reported.
-    Returns a deal-summary string, 'No deals found', or 'Error: ...'."""
+
+    `summary` is the display string get_store_deals has always returned.
+    `items` are the same markdowns as structured dicts, for callers that need
+    the prices themselves (the map popups sort and format them). It is empty
+    for per-chain plugins, which only ever produced a summary string."""
     website = store.get("website", "")
     host = urlparse(website).netloc.lower().removeprefix("www.")
     for domain, scraper in CUSTOM_SCRAPERS.items():
         if host == domain or host.endswith("." + domain):
             try:
-                return scraper(store)
+                return _result(summary=scraper(store))
             except Exception as e:
-                return f"Error: {domain} scraper failed ({type(e).__name__})"
+                return _result(summary=f"Error: {domain} scraper failed "
+                                       f"({type(e).__name__})")
 
     try:
         home_html = fetch_page(website)
     except Exception as e:
-        return f"Error: could not load site ({type(e).__name__}: {str(e)[:80]})"
+        return _result(summary=f"Error: could not load site "
+                               f"({type(e).__name__}: {str(e)[:80]})")
 
     # Ranked sale-page candidates double as Shopify collection hints below.
     pages = find_deal_pages(website, html=home_html)
@@ -327,7 +340,8 @@ def get_store_deals(store):
         if items:
             summary = platformScrapers.summarize_items(items, label="Sale")
             promos, _ = _promo_text(home_html, website)
-            return "\n".join(filter(None, [promos, summary]))
+            return _result(items=items, promos=promos,
+                           summary="\n".join(filter(None, [promos, summary])))
 
     # Walk the best few sale pages and pool their markdowns. Visiting more than
     # one matters: a chain's "shop all sale" page holds the items while its
@@ -358,14 +372,18 @@ def get_store_deals(store):
     promos, promo_error = _promo_text(home_html, website)
     combined = "\n".join(filter(None, [promos, summary]))
     if combined:
-        return combined
+        return _result(items=items, promos=promos, summary=combined)
     # Nothing found -- say why, so a bot wall or a broken API key is
     # distinguishable from a store that genuinely has no sale on.
     if promo_error:
-        return f"Error: {promo_error}"
+        return _result(summary=f"Error: {promo_error}")
     if errors:
-        return f"Error: {errors[0]}"
-    return "No deals found"
+        return _result(summary=f"Error: {errors[0]}")
+    return _result(summary="No deals found")
+
+
+def _result(summary, items=None, promos=None):
+    return {"items": items or [], "promos": promos, "summary": summary}
 
 
 # Failures that will hit every remaining store, not just this one: a blocked

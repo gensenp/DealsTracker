@@ -2,3 +2,6 @@
 venv/
 __pycache__/
 *.pyc
+
+# Generated geocoding cache (rebuilt on demand, one Nominatim call per address)
+store_locations.json
