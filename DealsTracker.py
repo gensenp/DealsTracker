@@ -136,8 +136,13 @@ def find_deal_pages(base_url, limit=3, html=None, patterns=None):
         full = urljoin(base_url, href)
         if urlparse(full).scheme not in ("http", "https"):
             continue
-        if urlparse(full).netloc.lower().removeprefix("www.") != host:
-            continue  # stay on the store's own site
+        link_host = urlparse(full).netloc.lower().removeprefix("www.")
+        # Stay on the store's own site, but allow its subdomains: chains often
+        # put the catalog on shop.brand.com while the homepage is brand.com, and
+        # an exact match dropped those links entirely.
+        if not (link_host == host or link_host.endswith("." + host)
+                or host.endswith("." + link_host)):
+            continue
         full = full.split("#")[0]
         if full in seen:
             continue
@@ -203,7 +208,13 @@ def render_html(url, timeout_ms=45000, headful=False, user_agent=BROWSER_UA):
 # bodies, just over the 200-char threshold) and get summarized as "no deals".
 BLOCK_MARKERS = ("access denied", "forbidden", "are you a human", "unusual traffic",
                  "enable javascript", "enable js", "bot detection", "request blocked",
-                 "pardon our interruption", "disable any ad blocker")
+                 "pardon our interruption", "disable any ad blocker",
+                 # PerimeterX serves its wall as HTTP 200 with ~500 chars of
+                 # prose, so neither the status code nor the length check catches
+                 # it. Its wording also just misses the markers above: "Access to
+                 # this page has been denied", "Please verify you are a human".
+                 "has been denied", "verify you are a human", "automation tools",
+                 "perimeterx", "datadome", "captcha")
 
 
 def fetch_page(url, timeout=15):
@@ -332,6 +343,16 @@ def collect_store_deals(store):
     pages = find_deal_pages(website, html=home_html)
     if not pages:
         pages = find_deal_pages(website, html=home_html, patterns=STORE_TIERS)
+    if not pages:
+        # A hover/dropdown menu is normally still in the markup, just hidden by
+        # CSS -- but some builders assemble the nav in JS, so its "Sale" entry
+        # exists only after the page runs. Render once and look again, bounded
+        # to stores where static parsing found no candidate at all.
+        rendered, _ = render_any_ua(website)
+        if rendered:
+            home_html = rendered
+            pages = (find_deal_pages(website, html=rendered)
+                     or find_deal_pages(website, html=rendered, patterns=STORE_TIERS))
 
     if platformScrapers.detect_platform(home_html) == "shopify":
         handles = [m.group(1) for m in
