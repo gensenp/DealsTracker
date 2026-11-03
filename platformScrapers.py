@@ -46,6 +46,13 @@ PRICE_LABEL_RE = re.compile(
     r"\s*(original|sale|now|current|regular|reduced)?\s*price\s*:?\s*$", re.I)
 
 
+# Form labels that sit inside a tile and parse as if they were the product.
+UI_LABELS = {"shoe size", "size", "sizes", "select size", "color", "colour",
+             "quantity", "qty", "select options", "sold out", "options",
+             "choose options", "add to cart", "select",
+             "view full product details", "view details", "shop now", "view all"}
+
+
 def _clean_name(text):
     """Trim badge and button text off a product name, or return None."""
     name = text.split("$")[0]  # prices always follow the name in tile markup
@@ -56,6 +63,8 @@ def _clean_name(text):
     half = len(name) // 2
     if half and name[:half].strip() == name[half:].strip():
         name = name[:half].strip()
+    if name.lower() in UI_LABELS:
+        return None
     return name if 2 < len(name) <= 120 else None
 
 
@@ -138,7 +147,11 @@ def parse_markdown_tiles(soup):
     Tiles are matched on the near-universal "product-tile"/"product-card"/
     "product-item" class naming. Prices inside a tile are split into current vs
     original by markup convention (see ORIGINAL_CLASS_RE), which avoids relying
-    on any one theme's class names."""
+    on any one theme's class names.
+
+    If no tile matches by class, fall back to deriving containers from the
+    prices themselves -- plenty of themes name the container something else
+    entirely (shopfringeclothing.com uses "one-third column thumbnail")."""
     # The `i` flag matters: CSS substring matching is case-sensitive by default,
     # so a bare [class*=product-tile] misses J.Crew's "ProductTileRevamped__…".
     tiles = soup.select(
@@ -146,6 +159,43 @@ def parse_markdown_tiles(soup):
         '[class*="product-card" i], [class*="productcard" i], '
         '[class*="product-item" i], [class*="grid-product" i], '
         '[class*="product-grid-item" i], li[class*="product" i]')
+    items = _extract(tiles)
+    return items or _extract(_tiles_from_prices(soup))
+
+
+def _tiles_from_prices(soup):
+    """Derive product containers by walking up from each struck-through price.
+
+    The nearest ancestor holding at least two amounts in a short span of text is
+    the tile: enough to pair a sale price with its original, small enough not to
+    swallow the whole grid into one bogus row."""
+    tiles, seen = [], set()
+    for node in soup.select('[class*="price" i], s, del'):
+        classes = " ".join(node.get("class") or [])
+        if not (node.name in ("s", "del") or ORIGINAL_CLASS_RE.search(classes)):
+            continue
+        ancestor = node
+        for _ in range(4):  # a tile is never far above its price
+            ancestor = ancestor.parent
+            if ancestor is None:
+                break
+            text = ancestor.get_text(" ", strip=True)
+            if len(text) > 300:
+                break  # past the tile and into the grid
+            # Needs both prices AND a name: the immediate parent of a struck
+            # price is usually a price wrapper holding nothing else, and a tile
+            # without a name gets discarded downstream anyway.
+            without_prices = MONEY_RE.sub(" ", text)
+            if (len(MONEY_RE.findall(text)) >= 2
+                    and len(re.sub(r"[^A-Za-z]", "", without_prices)) >= 3):
+                if id(ancestor) not in seen:
+                    seen.add(id(ancestor))
+                    tiles.append(ancestor)
+                break
+    return tiles
+
+
+def _extract(tiles):
     items, seen = [], set()
     for tile in tiles:
         price_nodes = tile.select('[class*="price" i], s, del')
@@ -168,6 +218,23 @@ def parse_markdown_tiles(soup):
             is_original = (node.name in ("s", "del")
                            or ORIGINAL_CLASS_RE.search(classes + " " + parent_classes))
             (originals if is_original else currents).append(amount)
+
+        if originals and not currents:
+            # Some themes mark up only the struck price and leave the live one
+            # as bare text in the tile. Recover it from the amounts that are
+            # not the original.
+            # findall yields the bare number, so parse it directly -- _money
+            # expects a leading "$" and would reject these.
+            leftover = []
+            for raw in MONEY_RE.findall(tile.get_text(" ", strip=True)):
+                try:
+                    leftover.append(float(raw.replace(",", "")))
+                except ValueError:
+                    pass
+            for value in originals:
+                if value in leftover:
+                    leftover.remove(value)
+            currents = leftover
 
         if not currents or not originals:
             continue

@@ -256,6 +256,84 @@ def fetch_page(url, timeout=15):
                                              "walled sites in a real browser)"))
 
 
+# Text that marks a control as the way to the markdowns. Matched on the visible
+# label, since this path exists precisely for the cases where there is no href
+# to read: a <button>, a JS-handled <div>, or an href="#" dropdown trigger.
+# Compiled with re.I rather than an inline (?i): Playwright translates these to
+# JavaScript RegExp, which rejects inline flag groups.
+CLICK_TEXT = re.compile(
+    r"\b(sale|clearance|outlet|markdowns?|final cut|final sale|deals?|"
+    r"last chance|reduced)\b", re.I)
+# Buttons that look right but lead away from the catalog.
+CLICK_SKIP = re.compile(r"newsletter|sign ?up|subscribe|email|cart|bag|"
+                        r"account|login|search|wholesale|gift card", re.I)
+
+
+def click_to_deal_page(url, timeout_ms=45000, max_attempts=4, user_agent=BROWSER_UA):
+    """Open `url` in a browser, click the control labelled Sale/Clearance, and
+    return (landed_url, html) for wherever that leads -- or (None, None).
+
+    Link-based discovery only sees <a href>. This covers the rest: nav entries
+    that are buttons or JS handlers, and dropdown triggers with href="#", where
+    the real destination only exists once something is clicked. Expensive, so
+    callers use it as a last resort.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(user_agent=user_agent, locale="en-US",
+                                          viewport={"width": 1440, "height": 900})
+            context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(1200)  # let a JS-built nav assemble
+            start_url = page.url
+
+            candidates = page.locator(
+                "a, button, [role=button], [role=menuitem], summary, "
+                "[class*=nav] li, [class*=menu] li"
+            ).filter(has_text=CLICK_TEXT)
+
+            for i in range(min(candidates.count(), max_attempts)):
+                item = candidates.nth(i)
+                try:
+                    label = (item.inner_text(timeout=2000) or "").strip()
+                except Exception:
+                    continue
+                # Long blocks mean the match came from a container, not a control.
+                if not label or len(label) > 40 or CLICK_SKIP.search(label):
+                    continue
+                try:
+                    item.scroll_into_view_if_needed(timeout=2000)
+                    item.hover(timeout=2000)   # opens hover-only dropdowns
+                    page.wait_for_timeout(400)
+                    item.click(timeout=3000)
+                    page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    continue
+
+                if page.url != start_url:
+                    return page.url, page.content()
+
+                # The click opened a menu rather than navigating. Follow the
+                # best real link it revealed.
+                revealed = page.locator("a[href]").filter(has_text=CLICK_TEXT)
+                for j in range(min(revealed.count(), 3)):
+                    href = revealed.nth(j).get_attribute("href") or ""
+                    if href and not href.startswith("#"):
+                        page.goto(urljoin(start_url, href),
+                                  wait_until="domcontentloaded", timeout=timeout_ms)
+                        page.wait_for_timeout(1200)
+                        return page.url, page.content()
+            return None, None
+        finally:
+            browser.close()
+
+
 def render_any_ua(url, headful=False):
     """Render `url`, trying the browser-like user agent and then the sparse one.
 
@@ -388,6 +466,19 @@ def collect_store_deals(store):
         items.extend(found)
         if items:
             break  # first page with real markdowns is enough
+
+    if not items:
+        # Last resort: drive the page. Covers a "Sale" that is a button, a JS
+        # handler or an href="#" dropdown trigger -- none of which link-based
+        # discovery can see, because there is no href to read.
+        try:
+            _, clicked_html = click_to_deal_page(website)
+        except Exception as e:
+            clicked_html = None
+            errors.append(f"{type(e).__name__} clicking through {website}")
+        if clicked_html:
+            items = platformScrapers.parse_markdown_tiles(
+                BeautifulSoup(clicked_html, "html.parser"))
 
     summary = platformScrapers.summarize_items(items, label="Sale")
     promos, promo_error = _promo_text(home_html, website)
