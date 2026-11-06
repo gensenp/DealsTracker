@@ -263,8 +263,15 @@ class ScrapeRun(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float)
     stage_used: Mapped[str | None] = mapped_column(String(32))
     deals_found: Mapped[int] = mapped_column(Integer, default=0)
+    promotions_found: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default=STATUS_OK)
     error_message: Mapped[str | None] = mapped_column(Text)
+
+    # What normalizing the source's output had to throw away. A chain whose
+    # rejected count climbs is usually a page redesign, not a sale that ended.
+    items_rejected: Mapped[int] = mapped_column(Integer, default=0)
+    duplicates_dropped: Mapped[int] = mapped_column(Integer, default=0)
+    originals_corrected: Mapped[int] = mapped_column(Integer, default=0)
 
     def __repr__(self) -> str:
         return f"<ScrapeRun chain={self.chain_id} {self.status} {self.deals_found} deals>"

@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from browser import BROWSER_UA, open_page
+from db import STAGE_FETCH, STAGE_HOVER, STAGE_RENDER
 from deals import coerce_deals, empty_deals, format_deals
 import nikeScraper
 import uniqloScraper
@@ -26,6 +27,18 @@ if not GOOGLE_PLACES_API_KEY:
 client = Groq(api_key=GROQ_API_KEY)
 
 LLM_MODEL = "openai/gpt-oss-120b"
+
+# How much page text the model reads, and how much JSON it may write back.
+# Groq's free tier allows 8000 tokens per minute, and ~1.8 chars make a token,
+# so 20k characters of page text is rejected outright with a 413. Staying under
+# the limit costs a little of the longest pages but avoids a guaranteed failure
+# on every one of them; raise this if the account moves to a paid tier.
+MAX_PROMPT_CHARS = 12000
+# A full sale page runs to 70+ items, and the default budget cuts the model off
+# mid-array: Groq then rejects the truncated JSON with a 400 rather than
+# returning it. Urban Outfitters' sale page needs ~10k tokens to come back
+# whole, and failed outright until this was raised.
+MAX_COMPLETION_TOKENS = 16000
 
 _EXTRACTION_PROMPT = """You are reading a clothing store web page: {url}
 
@@ -52,22 +65,49 @@ Web page text:
 {text}"""
 
 
+def _retry_on_less_text(exc):
+    """Errors a smaller slice of the page can fix.
+
+    json_validate_failed: Groq rejects its own output when the model was cut
+    off mid-JSON. rate_limit_exceeded: the request alone is over the account's
+    tokens-per-minute allowance."""
+    message = str(exc)
+    return "json_validate_failed" in message or "rate_limit_exceeded" in message
+
+
 def extract_deals(text, url):
-    """Ask the model for structured deals. Returns the shared deals shape."""
-    res = client.chat.completions.create(
-        model=LLM_MODEL,
-        temperature=0,  # extraction, not writing -- same page should give same rows
-        response_format={"type": "json_object"},
-        messages=[{"role": "user",
-                   "content": _EXTRACTION_PROMPT.format(url=url, text=text[:20000])}],
-    )
-    content = res.choices[0].message.content
-    try:
-        return coerce_deals(json.loads(content))
-    except (json.JSONDecodeError, TypeError):
-        # JSON mode makes this unlikely, but a truncated response shouldn't
-        # take down a whole search.
-        return empty_deals()
+    """Ask the model for structured deals. Returns the shared deals shape.
+
+    If a request fails for a reason less text can fix, retry on less of the
+    page: fewer items fit in the reply, which is worse than a complete read but
+    much better than losing the chain entirely."""
+    last_error = None
+    for attempt, chars in enumerate(
+            (MAX_PROMPT_CHARS, MAX_PROMPT_CHARS // 2, MAX_PROMPT_CHARS // 4)):
+        if attempt and "rate_limit_exceeded" in str(last_error):
+            time.sleep(2)  # let the per-minute allowance recover
+        try:
+            res = client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=0,  # extraction, not writing -- same page, same rows
+                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user",
+                           "content": _EXTRACTION_PROMPT.format(
+                               url=url, text=text[:chars])}],
+            )
+        except Exception as exc:
+            if not _retry_on_less_text(exc):
+                raise
+            last_error = exc
+            continue
+
+        try:
+            return coerce_deals(json.loads(res.choices[0].message.content))
+        except (json.JSONDecodeError, TypeError):
+            return empty_deals()
+
+    raise last_error
 
 def build_location(city, state=None, postal_code=None):
     """Join the location parts into the form Places understands best:
@@ -89,7 +129,10 @@ def find_clothing_stores(city, state=None, postal_code=None):
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        "X-Goog-FieldMask": "places.displayName,places.websiteUri,places.formattedAddress",
+        # places.id and places.location come from the Essentials SKU, which is
+        # already covered by the Pro fields below -- no change in billing tier.
+        "X-Goog-FieldMask": ("places.id,places.displayName,places.websiteUri,"
+                             "places.formattedAddress,places.location"),
     }
     body = {
         "textQuery": f"clothing stores in {location}",
@@ -108,10 +151,14 @@ def find_clothing_stores(city, state=None, postal_code=None):
         website = place.get("websiteUri")
         if not website:
             continue
+        location = place.get("location") or {}
         stores.append({
+            "place_id": place.get("id"),
             "name": place.get("displayName", {}).get("text", "(unknown)"),
             "website": website,
             "address": place.get("formattedAddress", ""),
+            "lat": location.get("latitude"),
+            "lng": location.get("longitude"),
         })
     return stores
 
@@ -253,13 +300,14 @@ def _find_deal_link_rendered(base_url, timeout_ms=20000):
     under Women/Men this way, and hovering "WOMEN" takes the page from 82 links
     to over 1100."""
     best, best_key = None, None
+    stage = STAGE_RENDER
     deadline = time.monotonic() + _RENDER_BUDGET_S
     with open_page() as page:
         page.goto(base_url, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_timeout(3000)  # let the nav hydrate
         best, best_key = _best_deal_link_keyed(page.content(), base_url)
         if best_key and best_key[1] <= _STRONG_RANK:
-            return best
+            return best, stage
 
         hovered = 0
         for item in page.query_selector_all(_NAV_ITEM_SELECTOR):
@@ -276,17 +324,20 @@ def _find_deal_link_rendered(base_url, timeout_ms=20000):
                 continue  # element detached or moved mid-hover -- try the next
             if key is not None and (best_key is None or key < best_key):
                 best, best_key = candidate, key
+                stage = STAGE_HOVER
             # A real sale section is as good as it gets; stop opening menus.
             if best_key and best_key[1] <= _STRONG_RANK:
                 break
-    return best
+    return best, stage
 
-def find_deals_page(base_url):
-    """Find a store's sale/deals page, starting from whatever URL Places gave
-    us -- often a store-locator page rather than the homepage. Tries a plain
-    fetch first, then a rendered one, because big chains build their nav in
-    JavaScript and turn away non-browser clients, so the <a href="/sale"> we
-    want frequently only exists once the page has run."""
+def discover_deals_page(base_url):
+    """Find a store's sale/deals page, as (url, stage) -- stage naming which
+    tier of the escalation found it, which the scrape log records.
+
+    Starts from whatever URL Places gave us, often a store-locator page rather
+    than a homepage. Tries a plain fetch first, then a rendered one, because big
+    chains build their nav in JavaScript and turn away non-browser clients, so
+    the <a href="/sale"> we want frequently only exists once the page has run."""
     html = ""
     try:
         res = requests.get(base_url, headers={"User-Agent": BROWSER_UA}, timeout=10)
@@ -297,11 +348,15 @@ def find_deals_page(base_url):
 
     best = _best_deal_link(html, base_url) if html else None
     if best:
-        return best
+        return best, STAGE_FETCH
     try:
         return _find_deal_link_rendered(base_url)
     except Exception:
-        return None
+        return None, None
+
+def find_deals_page(base_url):
+    """The discovered sale page URL, or None."""
+    return discover_deals_page(base_url)[0]
 
 def render_html(url, timeout_ms=45000):
     """Rendered DOM of a page, once its JavaScript has built the nav."""

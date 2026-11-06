@@ -17,14 +17,39 @@ Nothing here touches the network or the database, so it stays cheap to test.
 from __future__ import annotations
 
 import re
+from dataclasses import asdict, dataclass
 
 # Guards against a model that ignores instructions and returns a whole catalog.
 MAX_ITEMS = 200
 MAX_PROMOTIONS = 20
-# Beyond this a "price" is a phone number, a postcode or a year, not money.
+
+# A "price" outside this range is a phone number, a postcode or a year rather
+# than money. The ceiling is set well clear of real luxury retail -- Saks and
+# Nordstrom Rack list coats and handbags in the low thousands -- so only
+# obvious junk is dropped.
+MIN_PLAUSIBLE_PRICE = 0.01
 MAX_PLAUSIBLE_PRICE = 100_000.0
 
 _PRICE_CHARS = re.compile(r"[^\d.\-]")
+
+
+@dataclass
+class CoercionStats:
+    """What normalizing a source's output had to throw away or fix.
+
+    Stored per scrape so extraction quality is visible over time: a chain whose
+    rejected count suddenly climbs is usually a page redesign, not a sale that
+    ended."""
+    items_seen: int = 0
+    items_kept: int = 0
+    items_rejected: int = 0        # no usable name, or not a dict
+    duplicates_dropped: int = 0    # same product, one row per colourway
+    originals_corrected: int = 0   # original_price <= sale_price, so discarded
+    promotions_rejected: int = 0
+    truncated: bool = False        # hit MAX_ITEMS / MAX_PROMOTIONS
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 
 def empty_deals() -> dict:
@@ -53,12 +78,12 @@ def _coerce_price(value) -> float | None:
             price = float(match.group())
         except ValueError:
             return None
-    if price <= 0 or price > MAX_PLAUSIBLE_PRICE:
+    if price < MIN_PLAUSIBLE_PRICE or price > MAX_PLAUSIBLE_PRICE:
         return None
     return round(price, 2)
 
 
-def _coerce_item(raw) -> dict | None:
+def _coerce_item(raw, stats: CoercionStats) -> dict | None:
     if not isinstance(raw, dict):
         return None
     name = str(raw.get("name") or "").strip()
@@ -70,6 +95,7 @@ def _coerce_item(raw) -> dict | None:
     # An "original" at or below the sale price is noise, not a markdown.
     if sale is not None and original is not None and original <= sale:
         original = None
+        stats.originals_corrected += 1
 
     url = raw.get("product_url") or raw.get("url")
     url = str(url).strip() if url else None
@@ -80,38 +106,59 @@ def _coerce_item(raw) -> dict | None:
             "original_price": original, "product_url": url}
 
 
-def coerce_deals(raw) -> dict:
-    """Normalize whatever a source produced into the shared shape.
+def coerce_deals_with_stats(raw) -> tuple[dict, CoercionStats]:
+    """Normalize whatever a source produced, and report what was discarded.
 
     Written to never raise: a scraper returning nonsense should look like a
     chain with no deals, not take down the search."""
+    stats = CoercionStats()
     if not isinstance(raw, dict):
-        return empty_deals()
+        return empty_deals(), stats
+
+    raw_items = raw.get("items") or []
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = []
+    stats.items_seen = len(raw_items)
 
     items, seen = [], set()
-    for entry in (raw.get("items") or [])[:MAX_ITEMS * 2]:
-        item = _coerce_item(entry)
+    for entry in raw_items:
+        if len(items) >= MAX_ITEMS:
+            stats.truncated = True
+            break
+        item = _coerce_item(entry, stats)
         if not item:
+            stats.items_rejected += 1
             continue
         key = item["name"].lower()
         if key in seen:  # same product listed once per colourway
+            stats.duplicates_dropped += 1
             continue
         seen.add(key)
         items.append(item)
-        if len(items) >= MAX_ITEMS:
-            break
+    stats.items_kept = len(items)
+
+    raw_promos = raw.get("promotions") or []
+    if not isinstance(raw_promos, (list, tuple)):
+        raw_promos = []
 
     promotions, seen_promos = [], set()
-    for entry in (raw.get("promotions") or [])[:MAX_PROMOTIONS * 2]:
+    for entry in raw_promos:
+        if len(promotions) >= MAX_PROMOTIONS:
+            stats.truncated = True
+            break
         text = str(entry or "").strip()
         if not text or text.lower() in seen_promos:
+            stats.promotions_rejected += 1
             continue
         seen_promos.add(text.lower())
         promotions.append(text[:500])
-        if len(promotions) >= MAX_PROMOTIONS:
-            break
 
-    return {"items": items, "promotions": promotions}
+    return {"items": items, "promotions": promotions}, stats
+
+
+def coerce_deals(raw) -> dict:
+    """coerce_deals_with_stats, for callers that don't need the counts."""
+    return coerce_deals_with_stats(raw)[0]
 
 
 def has_deals(deals: dict) -> bool:
