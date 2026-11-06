@@ -124,6 +124,57 @@ class TestNormalizeName:
         assert normalize_name("Slim Jeans") != normalize_name("Straight Jeans")
 
 
+# --- Chain identity ---------------------------------------------------------
+class TestChainKey:
+    def test_brands_on_a_shared_domain_stay_separate(self):
+        """gap.com hosts four shops with four different sales. Collapsing them
+        would let whichever scraped first overwrite the rest."""
+        gap = db.chain_key("https://www.gap.com")
+        old_navy = db.chain_key("https://oldnavy.gap.com/stores/ma/boston/oldnavy-3055.html")
+        banana = db.chain_key("https://bananarepublic.gap.com")
+        athleta = db.chain_key("https://athleta.gap.com")
+
+        assert gap == "gap.com"
+        assert old_navy == "oldnavy.gap.com"
+        assert banana == "bananarepublic.gap.com"
+        assert athleta == "athleta.gap.com"
+        assert len({gap, old_navy, banana, athleta}) == 4
+
+    def test_locator_subdomain_is_the_same_chain(self):
+        """Places hands us the locator host; the sale link lives on www."""
+        assert (db.chain_key("https://stores.nordstromrack.com/us/ma/boston/497-boylston-st")
+                == db.chain_key("https://www.nordstromrack.com/clearance")
+                == "nordstromrack.com")
+
+    @pytest.mark.parametrize("host", [
+        "store.example.com", "stores.example.com", "locations.example.com",
+        "local.example.com", "shop.example.com", "m.example.com",
+        "www.example.com", "www2.example.com",
+    ])
+    def test_every_locator_prefix_collapses(self, host):
+        assert db.chain_key(f"https://{host}/x") == "example.com"
+
+    def test_override_wins_over_the_rule(self, monkeypatch):
+        monkeypatch.setitem(db.CHAIN_KEY_OVERRIDES, "oldnavy.gap.com", "gap.com")
+        assert db.chain_key("https://oldnavy.gap.com/anything") == "gap.com"
+
+    def test_multi_part_suffix_is_not_mistaken_for_a_brand(self):
+        assert db.chain_key("https://shop.foo.co.uk") == "foo.co.uk"
+        assert db.chain_key("https://brand.foo.co.uk") == "brand.foo.co.uk"
+
+    def test_deep_locator_host_still_finds_the_brand(self):
+        assert db.chain_key("https://www.oldnavy.gap.com") == "oldnavy.gap.com"
+
+    def test_bare_domain_and_blank_input(self):
+        assert db.chain_key("https://hm.com") == "hm.com"
+        assert db.chain_key("") == ""
+
+    def test_keeping_a_subdomain_is_logged_for_review(self, caplog):
+        with caplog.at_level("INFO", logger="db"):
+            db.chain_key("https://oldnavy.gap.com")
+        assert any("oldnavy.gap.com" in r.getMessage() for r in caplog.records)
+
+
 # --- Connection string ------------------------------------------------------
 class TestGetDatabaseUrl:
     def test_defaults_to_local_sqlite(self, monkeypatch):

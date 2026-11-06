@@ -14,35 +14,42 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
 
+PRODUCT_URL = "https://www.uniqlo.com/us/en/products/{product_id}"
+
+
 def scrape(store=None, limit=100):
-    """DealsTracker plugin entry point: return a short sale summary, or
-    'No deals found'."""
+    """DealsTracker plugin entry point: deals in the shared shape.
+
+    original_price is always None here. The endpoint exposes `prices.base` and
+    `prices.promo`, but across every discounted item the two carry the same
+    value and `isDualPrice` is false, so there is no crossed-out price to
+    report. Those items are excluded from discount ranking rather than being
+    shown as 0% off."""
     try:
         r = requests.get(API, params={"flagCodes": "discount", "limit": str(limit),
                                        "offset": "0", "httpFailure": "true"},
                          headers={"User-Agent": UA}, timeout=15)
         result = r.json().get("result", {})
     except Exception:
-        return "No deals found"
+        return {"items": [], "promotions": []}
 
-    items = result.get("items") or []
-    total = (result.get("pagination") or {}).get("total") or len(items)
-    priced = []
-    for it in items:
+    items = []
+    for it in result.get("items") or []:
         name = it.get("name")
         value = ((it.get("prices") or {}).get("base") or {}).get("value")
-        if name and value:
-            priced.append((name, value))
-    if not priced:
-        return "No deals found"
+        if not name or not value:
+            continue
+        product_id = it.get("productId")
+        items.append({
+            "name": name,
+            "sale_price": value,
+            "original_price": None,
+            "product_url": PRODUCT_URL.format(product_id=product_id) if product_id else None,
+        })
 
-    min_price = min(v for _, v in priced)
-    examples = sorted(priced, key=lambda nv: nv[1])[:5]
-    lines = [f"Uniqlo sale: {total} items on sale, from ${min_price:.2f}. Examples:"]
-    for name, value in examples:
-        lines.append(f"- {name} — ${value:.2f}")
-    return "\n".join(lines)
+    return {"items": items, "promotions": []}
 
 
 if __name__ == "__main__":
-    print(scrape())
+    import json
+    print(json.dumps(scrape(), indent=2)[:1200])

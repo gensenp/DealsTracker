@@ -10,11 +10,14 @@ are append-only (`price_snapshots`), so a product's history survives re-scrapes.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
+import tldextract
 from sqlalchemy import (
     DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
     create_engine,
@@ -60,6 +63,74 @@ def as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+# --- Chain identity ---------------------------------------------------------
+# Subdomains that only ever point at a locator, a mobile host or an alias --
+# the same shop, so they collapse into the registrable domain.
+LOCATOR_SUBDOMAINS = frozenset({
+    "store", "stores", "locations", "local", "shop", "m", "www", "www2",
+})
+
+# Hand-set keys for hosts the rule gets wrong. Maps a hostname to the chain key
+# it should use, and wins over everything below.
+CHAIN_KEY_OVERRIDES: dict[str, str] = {}
+
+log = logging.getLogger(__name__)
+
+# No network at import or first use: tldextract otherwise downloads the public
+# suffix list, which can hang in CI and on a cold deploy.
+_extract = tldextract.TLDExtract(suffix_list_urls=())
+
+
+def _hostname(url_or_host: str) -> str:
+    raw = (url_or_host or "").strip().lower()
+    if "//" in raw:
+        raw = urlparse(raw).netloc
+    return raw.split("@")[-1].split(":")[0].strip(".")
+
+
+def registrable_domain(url_or_host: str) -> str:
+    """The site-identifying part of a host: nordstromrack.com for both
+    www.nordstromrack.com and stores.nordstromrack.com, foo.co.uk for
+    shop.foo.co.uk."""
+    host = _hostname(url_or_host)
+    if not host:
+        return ""
+    parts = _extract(host)
+    # tldextract renamed this property in 5.x; keep working on either.
+    domain = getattr(parts, "top_domain_under_public_suffix", None)
+    if domain is None:
+        domain = parts.registered_domain
+    return domain or host
+
+
+def chain_key(url_or_host: str) -> str:
+    """Identity used to group stores into one retailer.
+
+    Defaults to the registrable domain, but keeps a brand subdomain, because a
+    multi-brand domain is several shops with different sales: oldnavy.gap.com,
+    bananarepublic.gap.com and athleta.gap.com all sit under gap.com but share
+    nothing a shopper would recognise."""
+    host = _hostname(url_or_host)
+    if not host:
+        return ""
+    if host in CHAIN_KEY_OVERRIDES:
+        return CHAIN_KEY_OVERRIDES[host]
+
+    domain = registrable_domain(host)
+    if not domain or host == domain:
+        return domain
+
+    prefix = host[: -(len(domain) + 1)]        # labels in front of the domain
+    brand = prefix.rsplit(".", 1)[-1]          # the one adjacent to the domain
+    if not brand or brand in LOCATOR_SUBDOMAINS:
+        return domain
+
+    key = f"{brand}.{domain}"
+    log.info("chain_key: keeping subdomain %r as its own chain (%s -> %s)",
+             brand, host, key)
+    return key
 
 
 _WHITESPACE = re.compile(r"\s+")

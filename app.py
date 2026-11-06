@@ -20,6 +20,7 @@ except Exception:
     pass  # no secrets.toml locally — .env handles it instead
 
 from DealsTracker import find_clothing_stores, get_store_deals, build_location
+from deals import format_deals, has_deals
 
 ANY_STATE = "— Any —"
 US_STATES = [
@@ -86,12 +87,10 @@ if submitted:
             with st.spinner("Scanning for deals…"):
                 deals = get_store_deals(store)
 
-            if deals.startswith("Error:"):
-                st.warning(deals)
-            elif "no deals found" in deals.lower():
-                st.write("🚫 No deals found")
+            if has_deals(deals):
+                st.success(format_deals(deals))
             else:
-                st.success(deals)
+                st.write("🚫 No deals found")
 
         progress.progress(i / len(stores))
 

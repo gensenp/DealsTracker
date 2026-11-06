@@ -61,28 +61,26 @@ def _collect(max_items=None, full_scroll=False):
 
 
 def scrape(store=None, max_items=150):
-    """DealsTracker plugin entry point: return a short sale summary, or
-    'No deals found'."""
+    """DealsTracker plugin entry point: deals in the shared shape.
+
+    Nike's API gives exact current/original pairs, so every item carries a real
+    original_price -- no LLM reading prices off rendered text."""
     items = _collect(max_items=max_items)
-    on_sale = [it for it in items if it["price"] < it["original_price"]]
-    if not on_sale:
-        return "No deals found"
 
-    best = {}  # name -> (price, original, pct), keeping deepest discount
-    for it in on_sale:
-        pct = round((1 - it["price"] / it["original_price"]) * 100)
-        if it["name"] not in best or pct > best[it["name"]][2]:
-            best[it["name"]] = (it["price"], it["original_price"], pct)
+    best = {}  # name -> item, keeping the deepest discount per product
+    for it in items:
+        if not it["original_price"] or it["price"] >= it["original_price"]:
+            continue
+        current = best.get(it["name"])
+        if current is None or it["price"] < current["sale_price"]:
+            best[it["name"]] = {
+                "name": it["name"],
+                "sale_price": it["price"],
+                "original_price": it["original_price"],
+                "product_url": it.get("pdp_url"),
+            }
 
-    max_pct = max(v[2] for v in best.values())
-    min_price = min(v[0] for v in best.values())
-    top = sorted(best.items(), key=lambda kv: kv[1][2], reverse=True)[:5]
-
-    lines = [f"Nike sale: {len(best)}+ items on sale, up to {max_pct}% off, "
-             f"from ${min_price:.2f}. Top markdowns:"]
-    for name, (cur, orig, pct) in top:
-        lines.append(f"- {name} — ${cur:.2f} (was ${orig:.2f}, {pct}% off)")
-    return "\n".join(lines)
+    return {"items": list(best.values()), "promotions": []}
 
 
 if __name__ == "__main__":

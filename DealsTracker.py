@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import requests
@@ -8,6 +9,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from browser import BROWSER_UA, open_page
+from deals import coerce_deals, empty_deals, format_deals
 import nikeScraper
 import uniqloScraper
 
@@ -23,24 +25,49 @@ if not GOOGLE_PLACES_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 
-def ask_groq(text, url):
-    res = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[{"role": "user", "content": f"""You are looking at a clothing store web page: {url}
+LLM_MODEL = "openai/gpt-oss-120b"
 
-List every deal, discount, or sale item on the page. ALL of these count as deals:
-- Storewide / category promotions (e.g. "20% off jeans", "buy one get one free", "free shipping over $50")
-- Coupon or promo codes
-- Individual items marked down: any item whose sale price is below its regular/original price, or labeled "Final sale", "Clearance", or "Save $X"
+_EXTRACTION_PROMPT = """You are reading a clothing store web page: {url}
 
-For marked-down items, give the item name with both prices, e.g. "Hazel Bubble Top — $68 (was $138)".
+Extract every deal on the page as JSON matching exactly this shape:
 
-If there are genuinely no deals or sale items anywhere on the page, reply with exactly: No deals found
+{{"items": [{{"name": "Hazel Bubble Top", "sale_price": 68, "original_price": 138, "product_url": null}}],
+ "promotions": ["20% off jeans", "Free shipping over $50"]}}
+
+Rules:
+- "items" holds individual products that are marked down: the price shown is
+  below a regular/original price, or the item is labelled Final Sale,
+  Clearance or "Save $X".
+- "promotions" holds storewide or category offers and coupon codes -- anything
+  not tied to one product. Plain strings.
+- sale_price is the price a shopper pays now. original_price is the crossed-out
+  price, or null if the page doesn't show one. Never invent an original price,
+  and never copy the sale price into it.
+- For a price range, use the lowest number.
+- Numbers only: no currency symbols, no commas.
+- Omit anything that isn't a real markdown. If the page has no deals at all,
+  return {{"items": [], "promotions": []}}.
 
 Web page text:
-{text[:20000]}"""}]
+{text}"""
+
+
+def extract_deals(text, url):
+    """Ask the model for structured deals. Returns the shared deals shape."""
+    res = client.chat.completions.create(
+        model=LLM_MODEL,
+        temperature=0,  # extraction, not writing -- same page should give same rows
+        response_format={"type": "json_object"},
+        messages=[{"role": "user",
+                   "content": _EXTRACTION_PROMPT.format(url=url, text=text[:20000])}],
     )
-    return res.choices[0].message.content
+    content = res.choices[0].message.content
+    try:
+        return coerce_deals(json.loads(content))
+    except (json.JSONDecodeError, TypeError):
+        # JSON mode makes this unlikely, but a truncated response shouldn't
+        # take down a whole search.
+        return empty_deals()
 
 def build_location(city, state=None, postal_code=None):
     """Join the location parts into the form Places understands best:
@@ -295,28 +322,32 @@ def render_text(url, timeout_ms=45000):
         page.wait_for_timeout(1500)
         return page.inner_text("body")
 
-def scrape_and_clean(url):
+def page_text(url):
+    """Readable text of a page: plain fetch first, browser if that gives a
+    shell. Returns "" when nothing readable came back (bot wall, dead page)."""
+    text = ""
     try:
-        text = ""
-        try:
-            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            if res.ok:
-                soup = BeautifulSoup(res.text, "html.parser")
-                for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                    tag.decompose()
-                text = soup.get_text(separator=" ", strip=True)
-        except requests.RequestException:
-            pass
-        # Blank shell (JS-rendered) or blocked -> render in a real browser.
-        if len(text) < 200:
-            text = render_text(url)
-        # Still nothing readable (bot-walled chain, dead page) -> treat as no
-        # deals rather than surfacing an error to the user.
-        if len(text.strip()) < 50:
-            return "No deals found"
-        return ask_groq(text, url)
+        res = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=10)
+        if res.ok:
+            soup = BeautifulSoup(res.text, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ", strip=True)
+    except requests.RequestException:
+        pass
+    # Blank shell (JS-rendered) or blocked -> render in a real browser.
+    if len(text) < 200:
+        text = render_text(url)
+    return text if len(text.strip()) >= 50 else ""
+
+
+def scrape_and_clean(url):
+    """Scrape one page into the shared deals shape."""
+    try:
+        text = page_text(url)
+        return extract_deals(text, url) if text else empty_deals()
     except Exception:
-        return "No deals found"
+        return empty_deals()
 
 # Per-chain scraper plugins, keyed by website domain. A chain with an
 # accessible API/feed gets a custom scraper here for cleaner, structured data;
@@ -326,19 +357,24 @@ CUSTOM_SCRAPERS = {
     "uniqlo.com": uniqloScraper.scrape,
 }
 
-def get_store_deals(store):
-    """Get deal text for one store. Tries a registered per-chain plugin first
-    (matched on the website's domain), otherwise uses the generic pipeline.
-    Returns a deal-summary string, or 'No deals found'."""
-    host = urlparse(store.get("website", "")).netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
+def custom_scraper_for(website):
+    """The per-chain scraper registered for this site, or None."""
+    host = _host(website or "")
     for domain, scraper in CUSTOM_SCRAPERS.items():
         if host == domain or host.endswith("." + domain):
-            try:
-                return scraper(store)
-            except Exception:
-                return "No deals found"
+            return scraper
+    return None
+
+def get_store_deals(store):
+    """Deals for one store, in the shared shape. Tries a registered per-chain
+    plugin first (matched on the website's domain), otherwise discovers the
+    sale page and scrapes it."""
+    scraper = custom_scraper_for(store.get("website", ""))
+    if scraper:
+        try:
+            return coerce_deals(scraper(store))
+        except Exception:
+            return empty_deals()
     target_url = find_deals_page(store["website"]) or store["website"]
     return scrape_and_clean(target_url)
 
@@ -351,5 +387,5 @@ if __name__ == "__main__":
     for store in stores:
         deals = get_store_deals(store)
         print(f"🛍️ {store['name']} — {store['address']}\n   {store['website']}")
-        print("  No deals" if "no deals found" in deals.lower() else f"  💰 {deals}")
+        print(f"  💰 {format_deals(deals)}")
         time.sleep(1)
