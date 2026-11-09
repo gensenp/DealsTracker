@@ -40,21 +40,6 @@ def has_deals(result):
     return not (summary.startswith("Error:") or "no deals found" in summary.lower())
 
 
-def failure_reason(result):
-    """Why a scan came back empty, or None if the store simply has no sale.
-
-    A store behind bot protection is a different thing from a store with
-    nothing on sale, and showing both as "No deals found" hid that: sites like
-    Anthropologie look identical to a quiet shop."""
-    summary = result["summary"]
-    if not summary.startswith("Error:"):
-        return None
-    reason = summary[len("Error:"):].strip()
-    if "bot protection" in reason.lower():
-        return "Blocked by this store's bot protection — its deals can't be read."
-    return reason
-
-
 def discount_pct(item):
     return round((1 - item["price"] / item["original"]) * 100)
 
@@ -75,9 +60,7 @@ def popup_html(store, result):
     body = f"<table style='font-size:12px'>{rows}</table>" if rows else ""
     promos = f"<div style='color:#c0392b;font-size:12px'>{result['promos']}</div>" if result["promos"] else ""
     if not body and not promos:
-        reason = failure_reason(result)
-        body = (f"<div style='font-size:12px;color:#b8860b'>⚠️ {reason}</div>" if reason
-                else "<div style='font-size:12px;color:#888'>No deals found</div>")
+        body = "<div style='font-size:12px;color:#888'>No deals found</div>"
     return (f"<div style='min-width:240px'>"
             f"<b>{store['name']}</b><br>"
             f"<span style='font-size:11px;color:#666'>{store.get('address','')}</span>"
@@ -110,24 +93,15 @@ def build_map(stores, origin, radius):
     for store in stores:
         result = store["result"]
         deals = has_deals(result)
-        blocked = failure_reason(result) is not None
         tooltip = store["name"]
         if store.get("distance_miles") is not None:
             tooltip += f" — {store['distance_miles']:.1f} mi"
-        if blocked:
-            tooltip += " (blocked)"
-        # Three states, not two: has deals, has none, or couldn't be read.
-        if deals:
-            colour, glyph = "red", "tag"
-        elif blocked:
-            colour, glyph = "orange", "ban"
-        else:
-            colour, glyph = "lightgray", "times"
         folium.Marker(
             (store["lat"], store["lon"]),
             tooltip=tooltip,
             popup=folium.Popup(popup_html(store, result), max_width=320),
-            icon=folium.Icon(color=colour, icon=glyph, prefix="fa"),
+            icon=folium.Icon(color="red" if deals else "lightgray",
+                             icon="tag" if deals else "times", prefix="fa"),
         ).add_to(cluster)
 
     if stores and not origin:
@@ -213,8 +187,6 @@ def map_section():
                     hide_index=True, width="stretch")
             elif has_deals(result):
                 st.success(result["summary"])
-            elif failure_reason(result):
-                st.warning(f"⚠️ {failure_reason(result)}")
             else:
                 st.write("🚫 No deals found")
 
@@ -228,8 +200,6 @@ def map_section():
                 result = store["result"]
                 if has_deals(result):
                     st.success(result["summary"])
-                elif failure_reason(result):
-                    st.warning(f"⚠️ {failure_reason(result)}")
                 else:
                     st.write("🚫 No deals found")
 
