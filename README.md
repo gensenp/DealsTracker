@@ -139,8 +139,7 @@ rendering:
 - **`uniqloScraper.py`** calls Uniqlo's commerce API — one request, no browser.
 
 Most sites don't need one. The generic path handles Urban Outfitters, H&M,
-J.Crew, Anthropologie, Gap, Macy's, Saks and Nordstrom Rack with no
-site-specific code. Add a custom scraper only when you find an API worth using,
+J.Crew, Gap, Macy's, Saks and Nordstrom Rack with no site-specific code. Add a custom scraper only when you find an API worth using,
 not because a site is awkward — hand-written selectors break on the next
 redesign.
 
