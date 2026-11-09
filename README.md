@@ -1,17 +1,21 @@
 # DealsTracker
 
-Find clothing stores in a city and scan their websites for what's actually on sale.
+Find clothing stores in a city and see what's actually on sale.
 
-Enter a city (optionally narrowed by state or ZIP), and DealsTracker looks up nearby
-clothing stores through Google Places, visits each store's site, finds its sale
-section, and summarizes the markdowns it finds — item names with both prices, plus
-any storewide promotions.
+Enter a city (optionally narrowed by state or ZIP), and DealsTracker looks up
+nearby clothing stores through Google Places, finds each retailer's sale
+section, and extracts the markdowns — item names with both prices, plus any
+storewide promotions. Results are saved, so searching the same city again reads
+from the database instead of scraping the web a second time.
 
 ```
-🛍️ H&M — 100 Newbury St, Boston, MA
-   REGULAR-FIT TRACK SHORTS — $10.99 (was $39.99)
-   OVERSIZED FIT PRINTED HOODIE — $17.99 (was $49.99)
+H&M                                    updated 4 minutes ago · 2 locations
+  Buy 2 Get 1 Free
+  REGULAR-FIT TRACK SHORTS — $10.99  $39.99 · 73% off
+  OVERSIZED FIT PRINTED HOODIE — $17.99  $49.99 · 64% off
 ```
+
+A first search of a city takes a few minutes. The next one takes about a second.
 
 ## Quick start
 
@@ -28,118 +32,200 @@ cp .env.example .env             # then fill in your two API keys
 python -m streamlit run app.py
 ```
 
-Python 3.11 or newer. `playwright install chromium` is required and is not covered
-by `pip install` — without it, every site that needs a browser silently returns no
-deals.
+Python 3.11 or newer. `playwright install chromium` is required and is **not**
+covered by `pip install` — without it, every site that needs a browser silently
+returns no deals.
 
 ### API keys
 
-Both are required. Put them in `.env` (which is gitignored):
-
-```
-GROQ_API_KEY=gsk_...
-GOOGLE_PLACES_API_KEY=AIza...
-```
+Both are required, in `.env` (which is gitignored):
 
 | Key | Where | Notes |
 |---|---|---|
-| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) | Free tier is enough |
-| `GOOGLE_PLACES_API_KEY` | [console.cloud.google.com](https://console.cloud.google.com) | Enable **Places API (New)**, not the legacy Places API. Requires a billing account even within free usage. |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) | Free tier works, with one caveat — see [Known limits](#known-limits) |
+| `GOOGLE_PLACES_API_KEY` | [console.cloud.google.com](https://console.cloud.google.com) | Enable **Places API (New)**, not the legacy Places API. Needs a billing account even within free usage. |
 
-If Places returns `403 PERMISSION_DENIED`, it's almost always one of: the New API
-isn't enabled, billing isn't set up, or the key has **Application restrictions**
-that block the machine making the call.
+If Places returns `403 PERMISSION_DENIED`, it's almost always one of: the New
+API isn't enabled, billing isn't set up, or the key has **Application
+restrictions** blocking the machine making the call.
+
+### Database
+
+`DATABASE_URL` is optional. Leave it unset and the app uses a local SQLite file
+(`dealstracker.db`), which is right for development — tables are created on
+first run, so there's no migration step.
+
+Set it to a PostgreSQL URL for anything that needs to persist. `postgres://`
+and `postgresql://` URLs are both accepted and rewritten to psycopg 3.
 
 ## How it works
 
 ```
 city + state/ZIP
       ↓  Google Places (searchText)
-stores with websites
-      ↓  per store
-find_deals_page()  →  sale/clearance URL
+stores, grouped by chain
+      ↓  per chain, only if its saved deals are stale
+discover sale page  →  scrape  →  extract
       ↓
-scrape_and_clean() →  page text
-      ↓  Groq LLM
-deal summary
+database  →  what the page renders
 ```
 
-Google Places usually returns a **store-locator page**, not a homepage — something
-like `stores.nordstromrack.com/us/ma/boston/497-boylston-st`. Getting from there to
-the actual sale page is most of the work, so `find_deals_page()` escalates through
+### Chains, not shops
+
+Every H&M in a city shows the same online sale, so scraping per location would
+repeat identical work. Stores are grouped by chain and each chain is scraped
+once; the UI shows one card per retailer with its locations underneath.
+
+Grouping uses the registrable domain, so `stores.nordstromrack.com` and
+`www.nordstromrack.com` are one chain. A brand subdomain is kept, though —
+`oldnavy.gap.com`, `bananarepublic.gap.com` and `athleta.gap.com` share a domain
+but are different shops with different sales. `CHAIN_KEY_OVERRIDES` in `db.py`
+fixes any case the rule gets wrong.
+
+### Finding the sale page
+
+Google Places usually returns a **store-locator page**, not a homepage —
+something like `stores.nordstromrack.com/us/ma/boston/497-boylston-st`. Getting
+from there to the sale page is most of the work, so discovery escalates through
 three stages and stops at the first that succeeds:
 
-1. **Plain fetch.** `requests` + BeautifulSoup, scoring every link. Fast (~0.5s) and
+1. **Plain fetch** — `requests` + BeautifulSoup, scoring every link. ~0.5s, and
    handles most sites.
-2. **Render.** Headless Chromium, for sites that build their nav in JavaScript or
-   refuse non-browser clients outright. Urban Outfitters returns 403 to `requests`.
-3. **Hover.** Mega-menus only build their submenu once the parent is pointed at, so
-   the Sale link genuinely isn't in the DOM until then. Hovering "WOMEN" on an H&M
-   store page takes it from 82 links to over 1,100.
+2. **Render** — headless Chromium, for sites that build their nav in JavaScript
+   or refuse non-browser clients. Urban Outfitters returns 403 to `requests`.
+3. **Hover** — mega-menus build their submenu only once the parent is pointed
+   at, so the Sale link genuinely isn't in the DOM until then. Hovering "WOMEN"
+   on an H&M store page takes it from 82 links to over 1,100.
 
-Link scoring prefers, in order: nav links over banners, `clearance`/`sale` over
-`deal`/`promo` (which tend to label campaign pages), clean URLs over tracking ones,
-and view-all pages over a single subcategory. Keywords match whole words in the URL
-path only — otherwise "whole**sale**", "**Salem**" and tracking params like
-`_CARD_RET_PROMO` all read as deals.
+Link scoring prefers nav links over banners, `clearance`/`sale` over
+`deal`/`promo` (which tend to label campaign pages), clean URLs over tracking
+ones, and view-all pages over a single subcategory. Keywords match whole words
+in the URL path only — otherwise "whole**sale**", "**Salem**" and tracking
+params like `_CARD_RET_PROMO` all read as deals.
+
+### Extraction
+
+Page text goes to an LLM (`openai/gpt-oss-120b` via Groq) in JSON mode at
+temperature 0, which returns items with both prices plus storewide promotions.
+Everything passes through `coerce_deals()` in `deals.py` before it reaches the
+database: prices are parsed from whatever form they arrive in, an
+`original_price` at or below the sale price is discarded rather than stored as
+a 0% markdown, duplicates collapse, and absurd values are rejected. It never
+raises — a broken source looks like a chain with no deals.
+
+### Caching
+
+| What | Fresh for | Why |
+|---|---|---|
+| A chain's deals | 6 hours | Repeat searches read the database |
+| A discovered sale URL | 7 days | Skips discovery entirely on re-scrape |
+| A dead end | 7 days | Primark has no sale page; T.J. Maxx is bot-walled |
+
+Dead ends are recorded, not worked around. Every scrape writes a `scrape_runs`
+row — duration, stage used, deals found, and what extraction discarded — so a
+page redesign shows up as a jump in rejects rather than a quiet drop in deals.
+
+Price history is append-only: re-scraping adds a `price_snapshots` row rather
+than overwriting, so a product's price over time survives.
 
 ### Custom scrapers
 
-`CUSTOM_SCRAPERS` in `DealsTracker.py` maps a domain to a scraper that bypasses the
-generic path. Two exist, and both are there for the same reason: the chain exposes a
-clean API that beats rendering.
+`CUSTOM_SCRAPERS` in `DealsTracker.py` maps a domain to a scraper that bypasses
+the generic path. Two exist, both because the chain exposes an API that beats
+rendering:
 
-- **`nikeScraper.py`** intercepts Nike's product-wall JSON, giving exact
-  current/original price pairs and real discount percentages.
-- **`uniqloScraper.py`** calls Uniqlo's public commerce API — one `requests` call,
-  no browser, full catalog.
+- **`nikeScraper.py`** intercepts Nike's product-wall JSON — exact
+  current/original pairs and product URLs.
+- **`uniqloScraper.py`** calls Uniqlo's commerce API — one request, no browser.
 
-Most sites don't need one. The generic path handles Urban Outfitters, H&M, J.Crew,
-Anthropologie, Gap, Macy's, Saks and Nordstrom Rack with no site-specific code.
-Add a custom scraper only when you find an API worth using, not just because a site
-is awkward — hand-written selectors break on the next redesign.
+Most sites don't need one. The generic path handles Urban Outfitters, H&M,
+J.Crew, Anthropologie, Gap, Macy's, Saks and Nordstrom Rack with no
+site-specific code. Add a custom scraper only when you find an API worth using,
+not because a site is awkward — hand-written selectors break on the next
+redesign.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `app.py` | Streamlit UI; also bridges Streamlit Secrets into the environment |
-| `DealsTracker.py` | Store lookup, deal-page discovery, scraping, LLM summarization |
-| `browser.py` | Shared Playwright setup — which Chromium, and looking like a real browser |
+| `app.py` | Streamlit page |
+| `ui.py` | Presentation helpers, kept free of streamlit so they're testable |
+| `pipeline.py` | Chain grouping, caching decisions, scrape logging |
+| `db.py` | SQLAlchemy models, chain identity, freshness rules |
+| `deals.py` | The shared deal shape every source returns |
+| `DealsTracker.py` | Places lookup, sale-page discovery, scraping, extraction |
+| `browser.py` | Playwright setup — which Chromium, and looking like a real browser |
 | `nikeScraper.py`, `uniqloScraper.py` | Per-chain API scrapers |
 | `packages.txt` | Installs Chromium on Streamlit Cloud |
 
-`DealsTracker.py` also runs standalone (`python DealsTracker.py`) for a San Jose scan.
+`DealsTracker.py` also runs standalone (`python DealsTracker.py`) for a San Jose
+scan that skips the database entirely.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+154 tests, no network and no API keys needed — scraping is stubbed and the
+database is in-memory SQLite. UI tests run the real page headless through
+streamlit's `AppTest`.
+
+Extraction has a recorded H&M sale page in `tests/fixtures/`, replayed offline.
+To re-extract it live instead (needs a Groq key and costs a call):
+
+```bash
+RUN_LLM_TESTS=1 pytest tests/test_extraction.py
+```
+
+Refresh the fixtures with `python tests/fixtures/capture.py` when the page
+changes enough that the recording no longer reflects reality.
 
 ## Deploying
 
-The app is set up for [Streamlit Community Cloud](https://share.streamlit.io):
+Set up for [Streamlit Community Cloud](https://share.streamlit.io):
 
 1. Point it at this repo, branch `main`, main file `app.py`.
 2. Set **Python version** to 3.12 under Advanced settings.
-3. Add both keys under **Secrets** in TOML form:
+3. Add your keys under **Secrets**:
    ```toml
    GROQ_API_KEY = "gsk_..."
    GOOGLE_PLACES_API_KEY = "AIza..."
+   DATABASE_URL = "postgresql://postgres.PROJECT:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres"
    ```
 
+**Use a hosted database when deployed.** Streamlit Cloud's filesystem is
+ephemeral, so a SQLite file there is wiped on every restart and redeploy — the
+cache would reset constantly and price history would never accumulate. Supabase's
+free tier is enough; its *pooled* connection string (port 6543) is the one to
+use, and `db.py` already disables prepared statements, which pgbouncer's
+transaction mode can't carry.
+
 Streamlit Cloud has no `playwright install` step — it gets Chromium from
-`packages.txt` instead, and `browser.py` points Playwright at that system binary.
-Keep `packages.txt` if you want the browser-dependent sites to work when deployed.
+`packages.txt`, and `browser.py` points Playwright at that system binary. Keep
+`packages.txt` if you want the browser-dependent sites to work when deployed.
 
 ## Known limits
 
-- **Some chains can't be scraped at all.** T.J. Maxx and Marshalls serve an Akamai
-  challenge page ("We've noticed some unusual activity") even to a real browser.
-  They report no deals rather than failing loudly.
+- **The free Groq tier costs you deals.** It allows 8,000 tokens per minute, and
+  a 20k-character page is ~11k tokens, so long pages are rejected outright. The
+  prompt window is capped at 12k characters to stay under it, which means fewer
+  items on the longest pages — Nordstrom Rack returns 61 items at 20k characters
+  but 24 at 12k. On a paid tier, raise `MAX_PROMPT_CHARS` in `DealsTracker.py`.
+- **Some chains can't be scraped at all.** T.J. Maxx and Marshalls serve an
+  Akamai challenge page even to a real browser. They're recorded as `blocked`
+  and skipped for a week rather than retried.
 - **Hammering a site gets you rate-limited.** Nordstrom Rack started refusing
   requests after repeated testing from one IP. It clears on its own.
-- **Not every store has a sale page.** Primark genuinely has none, and spends ~26s
-  looking before giving up. That's a correct result, not a bug.
-- **It's slow.** Roughly 8s per store, so a city returning 19 stores takes a few
-  minutes. Stores are scanned sequentially and each browser-dependent one launches
-  its own browser; the rendered phase is capped at 25s per store so one slow site
-  can't stall a whole search.
-- **Summaries come from an LLM** (`openai/gpt-oss-120b` via Groq) reading page text,
-  so prices are as accurate as the page is readable. The Nike and Uniqlo scrapers
-  return structured data and don't have this caveat.
+- **Not every store has a sale page.** Primark genuinely has none, and spends
+  ~26s looking before giving up. That's a correct result, not a bug.
+- **A first search is slow** — roughly 8s per chain, so a city with 18 retailers
+  takes about three minutes. Chains are scraped one at a time; the rendered
+  phase is capped at 25s each so one slow site can't stall a whole search.
+  Repeat searches of the same city take about a second.
+- **Prices are as accurate as the page is readable.** The LLM reads rendered
+  text; the Nike and Uniqlo scrapers return structured data and don't share that
+  caveat. Uniqlo exposes no original price at all, so its items carry only a
+  current price and are left out of discount ranking.
+- **Deals come from each retailer's website.** In-store prices may differ.

@@ -1,0 +1,5 @@
+# Everything the app needs, plus the test runner.
+# Kept out of requirements.txt so deploys don't install a test framework.
+-r requirements.txt
+
+pytest==9.2.0
