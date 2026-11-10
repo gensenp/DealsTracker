@@ -58,6 +58,62 @@ first run, so there's no migration step.
 Set it to a PostgreSQL URL for anything that needs to persist. `postgres://`
 and `postgresql://` URLs are both accepted and rewritten to psycopg 3.
 
+### Migrations
+
+Schema changes go through [Alembic](https://alembic.sqlalchemy.org). The one
+migration in `migrations/versions/` is the schema as it already stood when
+Alembic was introduced — it adds nothing.
+
+`alembic.ini` deliberately sets no URL. `migrations/env.py` takes it from
+`db.get_database_url()`, the same function the app uses, so Alembic and the app
+cannot be pointed at different databases. Set `DATABASE_URL` and Alembic
+follows it.
+
+**A database that already has these tables** — the Supabase one, created by
+`db.init_db()` before Alembic existed — is brought into the fold without
+running anything:
+
+```bash
+DATABASE_URL="postgresql://..." alembic stamp head
+```
+
+That records the initial revision as applied. Running it instead would fail on
+the first `CREATE TABLE`, because the tables are already there. Do this once.
+
+**A fresh database** gets the schema with:
+
+```bash
+DATABASE_URL="postgresql://..." alembic upgrade head
+```
+
+**Afterwards**, apply pending migrations with the same `upgrade head`. Use the
+pooled Supabase connection string (port 6543), the same one the app uses. To
+see what would run without running it:
+
+```bash
+alembic upgrade head --sql      # prints the SQL, touches nothing
+alembic current                 # which revision the database is on
+alembic history                 # what exists
+```
+
+**Writing one:** change the model in `db.py`, then
+
+```bash
+alembic revision --autogenerate -m "what changed"
+```
+
+and read the result before committing. Autogenerate is a first draft: it cannot
+see a rename, which it reports as a drop plus an add — losing the column's data
+if you apply it unexamined.
+
+**Note that `db.init_db()` still calls `create_all`.** That is what makes a
+local checkout work with no setup, and it is safe because a fresh SQLite file
+is built from the current models. But `create_all` cannot alter a table that
+already exists, so on Supabase it does nothing for a schema change — which is
+exactly the trap `tests/test_migrations.py` guards: it migrates a throwaway
+database and runs `alembic check`, so a model changed without a migration fails
+the suite rather than failing in production.
+
 ## How it works
 
 ```
@@ -244,6 +300,8 @@ Supabase to render one Streamlit page.
 | `api/` | The read-only FastAPI app — see [The API](#the-api) |
 | `api/queries.py` | The read-only SQL, shared with `pipeline.load_cached_deals` |
 | `geo.py` | Haversine distance and bounding boxes, for "shops near me" |
+| `migrations/` | Alembic migrations — see [Migrations](#migrations) |
+| `alembic.ini` | Alembic config; the URL comes from `db.py`, not from here |
 
 `DealsTracker.py` also runs standalone (`python DealsTracker.py`) for a San Jose
 scan that skips the database entirely.
@@ -255,7 +313,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-262 tests, no network and no API keys needed — scraping is stubbed and the
+267 tests, no network and no API keys needed — scraping is stubbed and the
 database is in-memory SQLite. UI tests run the real page headless through
 streamlit's `AppTest`, and the API tests go through FastAPI's `TestClient`
 against that same in-memory database.

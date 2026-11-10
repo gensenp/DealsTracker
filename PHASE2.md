@@ -40,6 +40,11 @@ The data is already available and being thrown away: the Places API returns
 `addressComponents` alongside `formattedAddress`, and `find_clothing_stores`
 asks for neither beyond the formatted string.
 
+This is the first real migration. Alembic is already set up and the initial
+revision matches the current schema, so this starts with `alembic revision
+--autogenerate -m "parsed address columns on stores"` once the model is
+changed — and `tests/test_migrations.py` fails until that migration exists.
+
 **Done looks like:** `Store` gains nullable `city`, `state` and `postal_code`
 columns. `find_clothing_stores` requests `places.addressComponents` and
 `upsert_stores` writes the parsed values; the Places field mask change needs
