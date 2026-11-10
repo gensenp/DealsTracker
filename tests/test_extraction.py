@@ -73,12 +73,19 @@ class TestRecordedExtraction:
 
 @pytest.fixture
 def dt_module():
-    """DealsTracker refuses to import without API keys, which CI won't have."""
-    try:
-        import DealsTracker
-    except RuntimeError as exc:
-        pytest.skip(f"DealsTracker needs API keys: {exc}")
+    """DealsTracker imports without API keys: they are resolved on use, so the
+    offline tests below exercise the retry ladder without a Groq account."""
+    import DealsTracker
     return DealsTracker
+
+
+class FakeGroqClient:
+    """Stands in for the Groq client so no key and no call are needed. Mirrors
+    only the one path extract_deals uses: client.chat.completions.create."""
+
+    def __init__(self, create):
+        completions = type("Completions", (), {"create": staticmethod(create)})()
+        self.chat = type("Chat", (), {"completions": completions})()
 
 
 class FakeCompletion:
@@ -102,7 +109,7 @@ class TestRetryLadder:
             return FakeCompletion('{"items": [{"name": "Tee", "sale_price": 9}],'
                                   ' "promotions": []}')
 
-        monkeypatch.setattr(dt_module.client.chat.completions, "create", create)
+        monkeypatch.setattr(dt_module, "groq_client", lambda: FakeGroqClient(create))
         monkeypatch.setattr(dt_module.time, "sleep", lambda s: None)
         return calls
 

@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 import DealsTracker as dt
 import db
+from api import queries as api_queries
 from db import (
     Chain, PriceSnapshot, Product, Promotion, ScrapeRun, Store,
     STAGE_CACHED, STAGE_CUSTOM_API,
@@ -189,34 +190,24 @@ def load_cached_deals(session, chain: Chain) -> dict:
     """The most recent scrape's deals, rebuilt from the database.
 
     Takes each product's latest snapshot, and the promotions from the run that
-    produced it, so a cached result matches what the last scrape saw."""
-    last = db.as_utc(chain.last_scraped_at)
-    if last is None:
+    produced it, so a cached result matches what the last scrape saw.
+
+    The queries live in api.queries, which the read-only API shares: this used
+    to run one query per product, and a chain with 200 of them made 200 round
+    trips to Supabase to render one page. Both callers now go through a single
+    window-function query. api.queries imports nothing from here, so there is
+    no cycle -- it reads db directly, the same as this module does."""
+    if chain.last_scraped_at is None:
         return empty_deals()
 
-    items = []
-    products = session.scalars(
-        select(Product).where(Product.chain_id == chain.id)).all()
-    for product in products:
-        snapshot = session.scalar(
-            select(PriceSnapshot)
-            .where(PriceSnapshot.product_id == product.id)
-            .order_by(PriceSnapshot.scraped_at.desc())
-            .limit(1))
-        # Only products seen in the latest scrape, not everything ever listed.
-        if snapshot is None or db.as_utc(snapshot.scraped_at) < last:
-            continue
-        items.append({"name": product.name,
-                      "sale_price": snapshot.sale_price,
-                      "original_price": snapshot.original_price,
-                      "product_url": product.product_url})
-
-    promos = session.scalars(
-        select(Promotion)
-        .where(Promotion.chain_id == chain.id, Promotion.scraped_at >= last)
-        .order_by(Promotion.scraped_at.desc())).all()
-
-    return {"items": items, "promotions": [p.text for p in promos]}
+    items, _total = api_queries.latest_deals(session, chain,
+                                             sort=api_queries.SORT_NAME)
+    return {"items": [{"name": item["name"],
+                       "sale_price": item["sale_price"],
+                       "original_price": item["original_price"],
+                       "product_url": item["product_url"]}
+                      for item in items],
+            "promotions": api_queries.latest_promotions(session, chain)}
 
 
 # --- Scraping ---------------------------------------------------------------

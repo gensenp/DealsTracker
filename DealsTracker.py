@@ -16,15 +16,30 @@ import uniqloScraper
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GOOGLE_PLACES_API_KEY = (os.environ.get("GOOGLE_PLACES_API_KEY") or "").strip().strip('"\'')
+# Credentials are read when they are used, not at import. Importing this module
+# must stay free of them: the read-only API serves saved deals out of the
+# database and never scrapes, so it would otherwise refuse to start -- and the
+# offline tests would need a Groq key to exercise code that never calls Groq.
+# The Streamlit app still fails with the same message, at search time rather
+# than at startup.
+def require_key(env_var, where):
+    """The named credential, or a RuntimeError naming where to get one."""
+    key = (os.environ.get(env_var) or "").strip().strip('"\'')
+    if not key:
+        raise RuntimeError(f"{env_var} not set in .env (get one at {where})")
+    return key
 
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not set in .env (get one at console.groq.com)")
-if not GOOGLE_PLACES_API_KEY:
-    raise RuntimeError("GOOGLE_PLACES_API_KEY not set in .env (get one at console.cloud.google.com)")
 
-client = Groq(api_key=GROQ_API_KEY)
+_groq_client = None
+
+
+def groq_client():
+    """The Groq client, built on first use and reused afterwards."""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=require_key("GROQ_API_KEY", "console.groq.com"))
+    return _groq_client
+
 
 LLM_MODEL = "openai/gpt-oss-120b"
 
@@ -87,7 +102,7 @@ def extract_deals(text, url):
         if attempt and "rate_limit_exceeded" in str(last_error):
             time.sleep(2)  # let the per-minute allowance recover
         try:
-            res = client.chat.completions.create(
+            res = groq_client().chat.completions.create(
                 model=LLM_MODEL,
                 temperature=0,  # extraction, not writing -- same page, same rows
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
@@ -125,10 +140,12 @@ def find_clothing_stores(city, state=None, postal_code=None):
     if not location:
         raise ValueError("Enter a city or a ZIP code.")
 
+    places_key = require_key("GOOGLE_PLACES_API_KEY",
+                             "console.cloud.google.com")
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-Api-Key": places_key,
         # places.id and places.location come from the Essentials SKU, which is
         # already covered by the Pro fields below -- no change in billing tier.
         "X-Goog-FieldMask": ("places.id,places.displayName,places.websiteUri,"
@@ -143,7 +160,7 @@ def find_clothing_stores(city, state=None, postal_code=None):
     if not res.ok:
         # Show a fingerprint of the key in use (never the full key) so a
         # mismatched deploy secret is easy to spot.
-        k = GOOGLE_PLACES_API_KEY
+        k = places_key
         raise RuntimeError(f"Places API {res.status_code} (key len={len(k)}, "
                            f"ends ...{k[-4:]}): {res.text}")
     stores = []

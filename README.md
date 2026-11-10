@@ -143,6 +143,75 @@ J.Crew, Gap, Macy's, Saks and Nordstrom Rack with no site-specific code. Add a c
 not because a site is awkward — hand-written selectors break on the next
 redesign.
 
+## The API
+
+A read-only JSON API over the saved deals, for the React frontend. It serves
+everything from the database and never scrapes, so it needs no API keys to run:
+
+```bash
+pip install -r requirements.txt
+uvicorn api.main:app --reload
+```
+
+Run it from the project root — `api/` imports `db` and `pipeline` as top-level
+modules, which resolve because the root is on `sys.path` when uvicorn starts
+there. Interactive docs are at <http://127.0.0.1:8000/docs>.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | Whether the database is reachable, and how many chains and stores are on record |
+| `GET /cities/{city}/deals?state=&zip=` | Chains with a shop in that city, each with its status, locations and a sample of its deals |
+| `GET /chains/{chain_key}/deals` | One chain's deals, with `min_discount` and `sort=discount\|price_asc\|price_desc\|newest\|name` |
+| `GET /stores?city=&chain_key=` | Store locations with coordinates, for the map |
+
+Every list response carries the same envelope:
+
+```json
+{"items": [], "pagination": {"limit": 50, "offset": 0, "total": 0, "has_more": false}}
+```
+
+and every failure the same one:
+
+```json
+{"error": {"code": "not_found", "message": "No chain with key 'nope.com'.", "detail": null}}
+```
+
+An unknown chain is a 404. Bad parameters are a **400** — not FastAPI's default
+422, which is remapped so a client has one error path rather than two codes
+meaning the same thing. A chain that exists but has no deals is a 200 whose
+`status` says why: `ok`, `no_sale_page`, `blocked` or `error`. A city nobody has
+searched yet is a 200 with an empty list, not a 404 — nothing has been collected
+for it, which a frontend should render as an empty state.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated browser origins. Unset allows the Vite dev server alone, so a misconfigured deploy fails closed rather than accepting every origin. |
+| `DATABASE_URL` | local SQLite | Same variable the Streamlit app uses. Point both at the same database and the API serves what a search saved. |
+
+```bash
+CORS_ORIGINS="https://deals.example.com,http://localhost:5173" uvicorn api.main:app
+```
+
+### What it reuses
+
+The API is a read layer, not a second copy of the app. Freshness comes from
+`db.deals_are_fresh` and `db.NEGATIVE_RECHECK_AFTER`, so `is_fresh` and
+`recheck_due_at` follow the same rules the scraper obeys; the status enum is
+built from `db.STATUS_*`, so a status added there cannot go missing from
+`/docs`; and `chain_key` normalizes the path parameter, so `/chains/www.hm.com`
+and `/chains/hm.com` are the same chain. What it deliberately does not reuse is
+`ui.py` — `humanize_age` and `money` are for a Streamlit page, and the API hands
+back ISO-8601 timestamps and plain numbers instead.
+
+`api/queries.py` holds the SQL. It exists because ordering by discount has to
+happen in the database: `?sort=discount&limit=20` must mean the twenty deepest
+markdowns the chain has, not the first twenty rows that arrived. The same
+window-function query now also backs `pipeline.load_cached_deals`, which used to
+run one query per product — a chain with 200 of them made 200 round trips to
+Supabase to render one Streamlit page.
+
 ## Files
 
 | File | Purpose |
@@ -156,6 +225,8 @@ redesign.
 | `browser.py` | Playwright setup — which Chromium, and looking like a real browser |
 | `nikeScraper.py`, `uniqloScraper.py` | Per-chain API scrapers |
 | `packages.txt` | Installs Chromium on Streamlit Cloud |
+| `api/` | The read-only FastAPI app — see [The API](#the-api) |
+| `api/queries.py` | The read-only SQL, shared with `pipeline.load_cached_deals` |
 
 `DealsTracker.py` also runs standalone (`python DealsTracker.py`) for a San Jose
 scan that skips the database entirely.
@@ -167,9 +238,10 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-154 tests, no network and no API keys needed — scraping is stubbed and the
+195 tests, no network and no API keys needed — scraping is stubbed and the
 database is in-memory SQLite. UI tests run the real page headless through
-streamlit's `AppTest`.
+streamlit's `AppTest`, and the API tests go through FastAPI's `TestClient`
+against that same in-memory database.
 
 Extraction has a recorded H&M sale page in `tests/fixtures/`, replayed offline.
 To re-extract it live instead (needs a Groq key and costs a call):
