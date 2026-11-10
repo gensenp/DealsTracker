@@ -399,6 +399,152 @@ class TestStores:
         assert res.json()["error"]["code"] == "bad_request"
 
 
+class TestStoresWithinRadius:
+    """Coordinates are seeded at real places so the distances mean something.
+
+    The `city` fixture puts every Boston store at the same point, which would
+    hide an ordering bug, so these seed their own spread of locations.
+    """
+
+    @pytest.fixture
+    def pins(self, session, city):
+        """Four stores at known distances from Boston Common."""
+        from tests.test_api import add_store  # the module's own helper
+
+        places = {
+            "Common": (42.3550, -71.0656, 0.0),      # the origin itself
+            "Fenway": (42.3467, -71.0972, 1.7),
+            "Harvard": (42.3736, -71.1190, 3.0),
+            "Providence": (41.8240, -71.4128, 41.0),
+        }
+        for name, (lat, lng, _expected) in places.items():
+            add_store(session, city["gap"], f"Gap {name}", lat=lat, lng=lng,
+                      place_id=f"pid-pin-{name}")
+        session.flush()
+        return places
+
+    ORIGIN = "lat=42.3550&lng=-71.0656"
+
+    def test_returns_only_stores_inside_the_circle(self, client, pins):
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=5").json()
+        names = {i["name"] for i in body["items"]}
+        assert "Gap Common" in names and "Gap Fenway" in names
+        assert "Gap Harvard" in names
+        assert "Gap Providence" not in names, "41 miles away, radius was 5"
+
+    def test_a_wider_radius_reaches_further(self, client, pins):
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=50").json()
+        assert "Gap Providence" in {i["name"] for i in body["items"]}
+
+    def test_results_are_nearest_first(self, client, pins):
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=50").json()
+        distances = [i["distance_miles"] for i in body["items"]]
+        assert distances == sorted(distances)
+
+    def test_distance_miles_is_reported_and_about_right(self, client, pins):
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=50").json()
+        measured = {i["name"]: i["distance_miles"] for i in body["items"]}
+        for name, (_lat, _lng, expected) in pins.items():
+            actual = measured[f"Gap {name}"]
+            tolerance = 1.0 if expected < 10 else 2.0
+            assert abs(actual - expected) < tolerance, (
+                f"Gap {name}: expected about {expected} mi, got {actual}")
+
+    def test_distance_is_null_without_a_radius_search(self, client, pins):
+        body = client.get("/stores?city=Boston").json()
+        assert all(i["distance_miles"] is None for i in body["items"])
+
+    def test_the_nearest_page_is_the_nearest_overall(self, client, pins):
+        """Ordering has to be decided across every store in range, not within
+        whichever page came back first. Asserted against the unpaged answer
+        rather than named stores, so seeding another shop into the fixture
+        cannot quietly turn this into a tautology."""
+        everything = client.get(
+            f"/stores?{self.ORIGIN}&radius_miles=50&limit=200").json()
+        first_page = client.get(
+            f"/stores?{self.ORIGIN}&radius_miles=50&limit=2").json()
+
+        assert [i["place_id"] for i in first_page["items"]] ==             [i["place_id"] for i in everything["items"]][:2]
+        assert first_page["items"][0]["name"] == "Gap Common", (
+            "the store at the origin itself must come first")
+        assert first_page["pagination"]["total"] == everything["pagination"]["total"]
+        assert first_page["pagination"]["has_more"] is True
+
+    def test_paging_walks_outwards_without_repeating(self, client, pins):
+        first = client.get(f"/stores?{self.ORIGIN}&radius_miles=50&limit=2").json()
+        second = client.get(
+            f"/stores?{self.ORIGIN}&radius_miles=50&limit=2&offset=2").json()
+        assert {i["place_id"] for i in first["items"]}.isdisjoint(
+            {i["place_id"] for i in second["items"]})
+        assert (max(i["distance_miles"] for i in first["items"])
+                <= min(i["distance_miles"] for i in second["items"]))
+
+    def test_total_counts_the_circle_not_the_bounding_box(self, client, pins):
+        """A store in the box's corner but outside the circle must not be
+        counted. At 42N a 5-mile box corner is about 7 miles out."""
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=5").json()
+        assert body["pagination"]["total"] == len(
+            [i for i in body["items"] if i["distance_miles"] <= 5])
+        assert all(i["distance_miles"] <= 5 for i in body["items"])
+
+    def test_a_corner_of_the_bounding_box_is_excluded(self, client, session,
+                                                      city, pins):
+        """Belt and braces for the box being a superset: a point diagonally
+        out at 1.4x the radius sits inside the box and outside the circle."""
+        add_store(session, city["gap"], "Gap Corner", lat=42.3550 + 0.0724,
+                  lng=-71.0656 + 0.0978, place_id="pid-pin-corner")
+        session.flush()
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=5").json()
+        assert "Gap Corner" not in {i["name"] for i in body["items"]}
+
+    def test_it_combines_with_the_other_filters(self, client, pins):
+        body = client.get(
+            f"/stores?{self.ORIGIN}&radius_miles=50&chain_key=hm.com").json()
+        assert {i["chain_key"] for i in body["items"]} == {"hm.com"}
+
+    def test_stores_without_coordinates_cannot_be_measured(self, client,
+                                                           session, city, pins):
+        add_store(session, city["gap"], "Gap Unplaced", lat=None, lng=None,
+                  place_id="pid-pin-unplaced")
+        session.flush()
+        body = client.get(f"/stores?{self.ORIGIN}&radius_miles=500").json()
+        assert "Gap Unplaced" not in {i["name"] for i in body["items"]}
+
+    @pytest.mark.parametrize("query", [
+        "lat=42.355",
+        "lng=-71.0656",
+        "radius_miles=5",
+        "lat=42.355&lng=-71.0656",
+        "lat=42.355&radius_miles=5",
+    ])
+    def test_a_partial_radius_search_is_400(self, client, pins, query):
+        """Ignoring a lone lat would answer a different question and look like
+        the filter had simply done nothing."""
+        res = client.get(f"/stores?{query}")
+        assert res.status_code == 400
+        body = res.json()
+        assert body["error"]["code"] == "bad_request"
+        assert "radius" in body["error"]["message"].lower()
+
+    @pytest.mark.parametrize("query", [
+        "lat=91&lng=0&radius_miles=5",
+        "lat=0&lng=181&radius_miles=5",
+        "lat=42.355&lng=-71.0656&radius_miles=0",
+        "lat=42.355&lng=-71.0656&radius_miles=-5",
+        "lat=42.355&lng=-71.0656&radius_miles=100000",
+    ])
+    def test_out_of_range_coordinates_are_400(self, client, pins, query):
+        res = client.get(f"/stores?{query}")
+        assert res.status_code == 400
+        assert res.json()["error"]["code"] == "bad_request"
+
+    def test_an_empty_circle_is_an_empty_list(self, client, pins):
+        """Mid-Atlantic, far from anything seeded."""
+        body = client.get("/stores?lat=30&lng=-40&radius_miles=50").json()
+        assert body["items"] == []
+        assert body["pagination"]["total"] == 0
+
+
 # --- Cross-cutting ---------------------------------------------------------------
 class TestApiContract:
     def test_cors_allows_the_react_dev_server(self, client, city):

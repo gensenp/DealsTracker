@@ -57,11 +57,14 @@ def store_summary(store: db.Store) -> StoreSummary:
                         website=store.website)
 
 
-def store_with_chain(store: db.Store, chain: db.Chain) -> StoreWithChain:
+def store_with_chain(store: db.Store, chain: db.Chain,
+                     distance_miles: float | None = None) -> StoreWithChain:
     return StoreWithChain(place_id=store.place_id, name=store.name,
                           address=store.address, lat=store.lat, lng=store.lng,
                           website=store.website, chain_key=chain.key,
-                          chain_name=chain.name, chain_status=chain.status)
+                          chain_name=chain.name, chain_status=chain.status,
+                          distance_miles=(None if distance_miles is None
+                                          else round(distance_miles, 2)))
 
 
 def chain_with_deals(session, chain: db.Chain, deals_per_chain: int

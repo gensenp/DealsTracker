@@ -96,6 +96,11 @@ class StoreWithChain(StoreSummary):
     chain_key: str
     chain_name: str | None = None
     chain_status: ChainStatus
+    distance_miles: float | None = Field(
+        default=None,
+        description="Straight-line distance from the `lat`/`lng` the request "
+                    "asked about, to two decimal places. Null unless the "
+                    "request was a radius search.")
 
 
 class ChainSummary(BaseModel):

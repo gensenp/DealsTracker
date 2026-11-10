@@ -341,6 +341,21 @@ class TestPersistence:
     def test_cached_deals_exclude_products_from_older_scrapes(self, memory_db, fake):
         """An item that has left the sale shouldn't reappear from history."""
         pipeline.search_deals("Boston", "MA")
+
+        # Push that scrape into the past before re-scraping. Everything here is
+        # stubbed, so two searches finish well inside one tick of the clock --
+        # about a millisecond on Windows -- and the older scrape would
+        # otherwise carry the same timestamp as the newer one, leaving no way
+        # for either this code or the assertion to tell them apart. Real
+        # scrapes are hours apart; see DEALS_FRESH_FOR.
+        earlier = utcnow() - timedelta(hours=1)
+        with db.session_scope() as s:
+            for snapshot in s.query(PriceSnapshot).all():
+                snapshot.scraped_at = earlier
+            for promotion in s.query(Promotion).all():
+                promotion.scraped_at = earlier
+            s.query(Chain).one().last_scraped_at = earlier
+
         fake.deals = {"items": [{"name": "Item 0", "sale_price": 9.0,
                                  "original_price": 40.0}], "promotions": []}
         pipeline.search_deals("Boston", "MA", force_keys={"example.com"})

@@ -163,6 +163,7 @@ there. Interactive docs are at <http://127.0.0.1:8000/docs>.
 | `GET /cities/{city}/deals?state=&zip=` | Chains with a shop in that city, each with its status, locations and a sample of its deals |
 | `GET /chains/{chain_key}/deals` | One chain's deals, with `min_discount` and `sort=discount\|price_asc\|price_desc\|newest\|name` |
 | `GET /stores?city=&chain_key=` | Store locations with coordinates, for the map |
+| `GET /stores?lat=&lng=&radius_miles=` | Locations within that radius, nearest first, each with `distance_miles` |
 
 Every list response carries the same envelope:
 
@@ -193,6 +194,21 @@ for it, which a frontend should render as an empty state.
 ```bash
 CORS_ORIGINS="https://deals.example.com,http://localhost:5173" uvicorn api.main:app
 ```
+
+### Distance search
+
+`lat`, `lng` and `radius_miles` go together; any one of them alone is a 400,
+because quietly ignoring a lone `lat` would answer a different question from
+the one asked. Results come back nearest first with `distance_miles` on each,
+and the ordering is settled across every store in range before the page is cut
+— `radius_miles=5&limit=10` is the ten nearest within five miles, not ten
+arbitrary ones. Distances are straight-line, not driving distance.
+
+It runs in two steps: SQL narrows to a bounding box, then `geo.py` measures
+what is left and sorts it. The box is deliberately a superset of the circle, so
+the exact check afterwards is what decides the answer. Trigonometry stays out of
+SQL because it is not portable — PostgreSQL always has `sin`/`cos`/`radians`,
+SQLite only when built with `SQLITE_ENABLE_MATH_FUNCTIONS`.
 
 ### What it reuses
 
@@ -227,6 +243,7 @@ Supabase to render one Streamlit page.
 | `packages.txt` | Installs Chromium on Streamlit Cloud |
 | `api/` | The read-only FastAPI app — see [The API](#the-api) |
 | `api/queries.py` | The read-only SQL, shared with `pipeline.load_cached_deals` |
+| `geo.py` | Haversine distance and bounding boxes, for "shops near me" |
 
 `DealsTracker.py` also runs standalone (`python DealsTracker.py`) for a San Jose
 scan that skips the database entirely.
@@ -238,7 +255,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-216 tests, no network and no API keys needed — scraping is stubbed and the
+250 tests, no network and no API keys needed — scraping is stubbed and the
 database is in-memory SQLite. UI tests run the real page headless through
 streamlit's `AppTest`, and the API tests go through FastAPI's `TestClient`
 against that same in-memory database.

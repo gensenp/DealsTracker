@@ -20,6 +20,7 @@ from datetime import datetime
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 
+import geo
 from db import Chain, PriceSnapshot, Product, Promotion, Store, chain_key
 
 # Sort keys accepted by /chains/{chain_key}/deals.
@@ -234,22 +235,62 @@ def latest_promotions(session: Session, chain: Chain) -> list[str]:
 
 def stores_query(city: str | None = None, state: str | None = None,
                  postal_code: str | None = None, key: str | None = None,
-                 with_coordinates: bool = True) -> Select:
+                 with_coordinates: bool = True,
+                 box: tuple[float, float, float, float] | None = None) -> Select:
     """Store locations, joined to the chain that owns each.
 
     Coordinates are nullable in the schema and get cleared by
     `clear_stale_place_details` once Google's caching window is up, so by
     default rows without them are left out: this endpoint exists to put pins on
     a map, and a pin needs a position. Pass with_coordinates=False for the lot.
+
+    `box` narrows to a latitude/longitude rectangle, which is how a radius
+    search avoids measuring every store in the database. It is a superset of
+    the circle; the exact distances are worked out on what it returns.
     """
     stmt = select(Store, Chain).join(Chain, Store.chain_id == Chain.id)
     for clause in address_filters(city, state, postal_code):
         stmt = stmt.where(clause)
     if key:
         stmt = stmt.where(Chain.key == key)
-    if with_coordinates:
+    if with_coordinates or box is not None:
         stmt = stmt.where(Store.lat.is_not(None), Store.lng.is_not(None))
+    if box is not None:
+        min_lat, max_lat, min_lng, max_lng = box
+        stmt = stmt.where(Store.lat >= min_lat, Store.lat <= max_lat,
+                          Store.lng >= min_lng, Store.lng <= max_lng)
     return stmt.order_by(Chain.key, Store.name, Store.id)
+
+
+def stores_within_radius(session: Session, lat: float, lng: float,
+                         radius_miles: float, **filters
+                         ) -> list[tuple[Store, Chain, float]]:
+    """Stores inside the circle, nearest first, each with its distance.
+
+    Two steps, because they do different jobs. SQL narrows to a bounding box,
+    which is cheap, portable and throws away nearly everything. Python then
+    measures what is left exactly and sorts it.
+
+    The sort and the count happen here rather than in SQL for the same reason
+    the discount sort happens in SQL: whichever layer decides the order has to
+    see every candidate. Paging in SQL on an unordered-by-distance query would
+    hand back an arbitrary slice and call it "the five nearest". The bounding
+    box keeps that set small enough for this to be the cheaper trade -- a
+    radius search over a city is tens of rows, not millions -- and it keeps the
+    trigonometry out of SQL, where SQLite cannot be relied on to have it.
+    """
+    box = geo.bounding_box(lat, lng, radius_miles)
+    rows = session.execute(stores_query(box=box, **filters)).all()
+
+    measured = []
+    for store, chain in rows:
+        distance = geo.haversine_miles(lat, lng, store.lat, store.lng)
+        if distance <= radius_miles:
+            measured.append((store, chain, distance))
+    # Ties broken by name, so equal distances come back in a stable order
+    # rather than whatever the database happened to yield.
+    measured.sort(key=lambda row: (row[2], row[0].name or "", row[0].id))
+    return measured
 
 
 def count_of(session: Session, stmt: Select) -> int:
