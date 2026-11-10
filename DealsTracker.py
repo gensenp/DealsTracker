@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from dataclasses import dataclass
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -347,9 +348,23 @@ def _find_deal_link_rendered(base_url, timeout_ms=20000):
                 break
     return best, stage
 
+@dataclass
+class Discovery:
+    """What looking for a chain's sale page turned up.
+
+    `blocked` is the reason this is a class rather than the (url, stage) pair
+    it used to be. Finding no sale link means "this shop has no sale section"
+    only if we were shown the shop: a bot wall has no nav to find a link in, so
+    the two outcomes are indistinguishable from the URL alone, and the caller
+    needs to be told which it was.
+    """
+    url: str | None = None
+    stage: str | None = None
+    blocked: bool = False
+
+
 def discover_deals_page(base_url):
-    """Find a store's sale/deals page, as (url, stage) -- stage naming which
-    tier of the escalation found it, which the scrape log records.
+    """Find a store's sale/deals page, as a Discovery.
 
     Starts from whatever URL Places gave us, often a store-locator page rather
     than a homepage. Tries a plain fetch first, then a rendered one, because big
@@ -365,15 +380,27 @@ def discover_deals_page(base_url):
 
     best = _best_deal_link(html, base_url) if html else None
     if best:
-        return best, STAGE_FETCH
+        return Discovery(best, STAGE_FETCH)
+
+    # No link in the markup. Before concluding the shop has no sale section,
+    # check whether we were looking at the shop at all -- loft.com answers its
+    # homepage with a PerimeterX wall, served as HTTP 200, which has no nav and
+    # so yields no candidate however hard it is parsed.
+    walled = looks_blocked(visible_text(html))
+
+    # A wall still gets the rendered attempt: some are shown only to clients
+    # that do not look like browsers, and a real nav may appear.
     try:
-        return _find_deal_link_rendered(base_url)
+        rendered, stage = _find_deal_link_rendered(base_url)
     except Exception:
-        return None, None
+        return Discovery(None, None, blocked=walled)
+    if rendered:
+        return Discovery(rendered, stage)
+    return Discovery(None, stage, blocked=walled)
 
 def find_deals_page(base_url):
     """The discovered sale page URL, or None."""
-    return discover_deals_page(base_url)[0]
+    return discover_deals_page(base_url).url
 
 def render_html(url, timeout_ms=45000):
     """Rendered DOM of a page, once its JavaScript has built the nav."""
@@ -425,6 +452,16 @@ def looks_blocked(text):
     return any(marker in lowered for marker in BLOCK_MARKERS)
 
 
+def visible_text(html):
+    """Readable text of an HTML document, with the furniture stripped out."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
+
+
 def page_text(url):
     """Readable text of a page: plain fetch first, browser if that gives a
     shell. Returns "" when nothing readable came back (bot wall, dead page)."""
@@ -432,10 +469,7 @@ def page_text(url):
     try:
         res = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=10)
         if res.ok:
-            soup = BeautifulSoup(res.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                tag.decompose()
-            text = soup.get_text(separator=" ", strip=True)
+            text = visible_text(res.text)
     except requests.RequestException:
         pass
     # Blank shell (JS-rendered) or blocked -> render in a real browser. A wall

@@ -75,10 +75,12 @@ class TestChainDisplayName:
 class FakeScraper:
     """Stands in for the network, and counts how often it was asked to work."""
 
-    def __init__(self, deals=None, sale_url="https://x.com/sale", text="page text"):
+    def __init__(self, deals=None, sale_url="https://x.com/sale", text="page text",
+                 blocked=False):
         self.deals = deals if deals is not None else some_deals()
         self.sale_url = sale_url
         self.text = text
+        self.blocked = blocked      # discovery met a wall instead of a shop
         self.discovery_calls = 0
         self.page_calls = 0
         self.extract_calls = 0
@@ -90,7 +92,8 @@ class FakeScraper:
 
         def discover(url):
             self.discovery_calls += 1
-            return self.sale_url, STAGE_FETCH
+            return pipeline.dt.Discovery(self.sale_url, STAGE_FETCH,
+                                         blocked=self.blocked)
 
         def page_text(url):
             self.page_calls += 1
@@ -216,6 +219,22 @@ class TestNegativeCaching:
         fake.text = ""              # rendered, but nothing readable (bot wall)
         result = pipeline.search_deals("Boston", "MA")
         assert result.chains[0].status == STATUS_BLOCKED
+
+    def test_a_walled_homepage_is_blocked_not_no_sale_page(self, memory_db, fake):
+        """Discovery finding no link means "no sale section" only if we were
+        shown the shop. A wall has no nav, so it yields no link either."""
+        fake.sale_url = None
+        fake.blocked = True
+        result = pipeline.search_deals("Boston", "MA")
+        assert result.chains[0].status == STATUS_BLOCKED
+
+    def test_no_link_on_a_real_homepage_is_still_no_sale_page(self, memory_db,
+                                                              fake):
+        """The other half of the same decision: Primark genuinely has none."""
+        fake.sale_url = None
+        fake.blocked = False
+        result = pipeline.search_deals("Boston", "MA")
+        assert result.chains[0].status == STATUS_NO_SALE_PAGE
 
     def test_a_wall_served_as_http_200_is_blocked_not_no_sale_page(
             self, memory_db, fake, monkeypatch):

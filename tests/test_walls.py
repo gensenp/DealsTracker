@@ -146,3 +146,117 @@ class TestPageText:
         stub_fetch(monkeypatch, "<html><body>Hi</body></html>")
         stub_render(monkeypatch, "Hi")
         assert dt.page_text("https://example.com/sale") == ""
+
+
+class TestVisibleText:
+    def test_strips_markup_and_furniture(self):
+        html = ("<html><head><style>.a{color:red}</style></head><body>"
+                "<nav>Home Shop</nav><script>var x=1</script>"
+                "<main>Linen Shirt 19.99</main></body></html>")
+        text = dt.visible_text(html)
+        assert "Linen Shirt 19.99" in text
+        assert "var x" not in text and "color:red" not in text
+
+    def test_empty_input_is_empty(self):
+        assert dt.visible_text("") == ""
+        assert dt.visible_text(None) == ""
+
+    def test_a_wall_hidden_in_long_markup_is_still_found(self):
+        """The length guard applies to readable text, not to the source. A
+        wall page can carry kilobytes of script and still say two sentences."""
+        html = ("<html><head>" + "<script>" + ("x = 1; " * 500) + "</script>"
+                "</head><body><p>" + PERIMETERX_WALL + "</p></body></html>")
+        assert len(html) > dt.WALL_MAX_CHARS
+        assert dt.looks_blocked(dt.visible_text(html))
+
+
+class TestDiscoveryMeetsAWall:
+    """A walled homepage used to be reported as a shop with no sale section.
+
+    Discovery never reached a sale page to apply the text-level check to: the
+    wall has no nav, so no candidate link was found and the chain was filed as
+    having none. loft.com answers exactly this way.
+    """
+
+    @pytest.fixture
+    def never_renders(self, monkeypatch):
+        """Discovery falls back to a browser; these tests have none."""
+        monkeypatch.setattr(dt, "_find_deal_link_rendered",
+                            lambda url, **kwargs: (None, None))
+
+    def test_a_walled_homepage_is_reported_as_blocked(self, monkeypatch,
+                                                      never_renders):
+        stub_fetch(monkeypatch, f"<html><body>{PERIMETERX_WALL}</body></html>")
+        found = dt.discover_deals_page("https://www.loft.com/")
+        assert found.url is None
+        assert found.blocked is True
+
+    def test_a_real_homepage_without_a_sale_link_is_not_blocked(
+            self, monkeypatch, never_renders):
+        """Primark genuinely has no sale section. The two outcomes must stay
+        distinguishable, or this fix just relabels one wrong answer as another."""
+        shop = ("<html><body><nav><a href='/women'>Women</a>"
+                "<a href='/men'>Men</a><a href='/about'>About us</a></nav>"
+                "<main>New in this week</main></body></html>")
+        stub_fetch(monkeypatch, shop)
+        found = dt.discover_deals_page("https://www.primark.com/")
+        assert found.url is None
+        assert found.blocked is False
+
+    def test_a_homepage_with_a_sale_link_is_neither(self, monkeypatch,
+                                                    never_renders):
+        shop = "<html><body><nav><a href='/sale'>Sale</a></nav></body></html>"
+        stub_fetch(monkeypatch, shop)
+        found = dt.discover_deals_page("https://www.example.com/")
+        assert found.url == "https://www.example.com/sale"
+        assert found.stage is not None
+        assert found.blocked is False
+
+    def test_the_browser_still_gets_its_turn_at_a_wall(self, monkeypatch):
+        """Some walls are shown only to clients that don't look like browsers,
+        so a wall must not short-circuit the rendered attempt."""
+        stub_fetch(monkeypatch, f"<html><body>{PERIMETERX_WALL}</body></html>")
+        rendered = []
+
+        def render(url, **kwargs):
+            rendered.append(url)
+            return "https://www.loft.com/sale", "render"
+
+        monkeypatch.setattr(dt, "_find_deal_link_rendered", render)
+
+        found = dt.discover_deals_page("https://www.loft.com/")
+        assert rendered, "the wall should not have skipped rendering"
+        assert found.url == "https://www.loft.com/sale"
+        assert found.blocked is False, "the browser got through"
+
+    def test_a_browser_failure_still_reports_the_wall(self, monkeypatch):
+        """If rendering raises, what the plain fetch saw is all we know -- and
+        it was a wall."""
+        stub_fetch(monkeypatch, f"<html><body>{PERIMETERX_WALL}</body></html>")
+
+        def boom(url, **kwargs):
+            raise RuntimeError("no browser installed")
+
+        monkeypatch.setattr(dt, "_find_deal_link_rendered", boom)
+
+        found = dt.discover_deals_page("https://www.loft.com/")
+        assert found.url is None
+        assert found.blocked is True
+
+    def test_an_unreachable_site_is_not_called_a_wall(self, monkeypatch,
+                                                      never_renders):
+        """A refused connection is not evidence of being blocked."""
+        def refuse(url, **kwargs):
+            raise dt.requests.RequestException("connection refused")
+
+        monkeypatch.setattr(dt.requests, "get", refuse)
+        found = dt.discover_deals_page("https://www.example.com/")
+        assert found.url is None
+        assert found.blocked is False
+
+    def test_find_deals_page_still_returns_just_the_url(self, monkeypatch,
+                                                       never_renders):
+        """The old two-tuple callers go through this helper."""
+        shop = "<html><body><a href='/sale'>Sale</a></body></html>"
+        stub_fetch(monkeypatch, shop)
+        assert dt.find_deals_page("https://www.example.com/") ==             "https://www.example.com/sale"

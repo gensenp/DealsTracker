@@ -211,10 +211,17 @@ def load_cached_deals(session, chain: Chain) -> dict:
 
 
 # --- Scraping ---------------------------------------------------------------
-def _classify_failure(sale_url: str | None, text_found: bool) -> str:
-    """Why a chain produced nothing: no sale page at all, or a wall."""
+def _classify_failure(sale_url: str | None, text_found: bool,
+                     discovery_blocked: bool = False) -> str:
+    """Why a chain produced nothing: no sale page at all, or a wall.
+
+    Discovery finding no sale link used to be read as "no sale page" outright.
+    That is only true when we were shown the shop -- a bot wall has no nav, so
+    it yields no link either, and reporting it as a shop with nothing on sale
+    both misinforms the shopper and caches the wrong answer for a week.
+    """
     if sale_url is None:
-        return STATUS_NO_SALE_PAGE   # discovery ran and found no such link
+        return STATUS_BLOCKED if discovery_blocked else STATUS_NO_SALE_PAGE
     return STATUS_BLOCKED if not text_found else STATUS_NO_SALE_PAGE
 
 
@@ -235,6 +242,7 @@ def scrape_chain(session, chain: Chain, stores: list[dict]) -> ChainResult:
     stage = None
 
     try:
+        discovery_blocked = False
         scraper = dt.custom_scraper_for(website or "")
         if scraper:
             stage = STAGE_CUSTOM_API
@@ -246,7 +254,9 @@ def scrape_chain(session, chain: Chain, stores: list[dict]) -> ChainResult:
             if sale_url_is_trusted(chain):
                 sale_url, stage = chain.sale_url, STAGE_CACHED
             else:
-                sale_url, stage = dt.discover_deals_page(website or "")
+                found = dt.discover_deals_page(website or "")
+                sale_url, stage = found.url, found.stage
+                discovery_blocked = found.blocked
 
             if sale_url:
                 text = dt.page_text(sale_url)
@@ -273,7 +283,8 @@ def scrape_chain(session, chain: Chain, stores: list[dict]) -> ChainResult:
                 result.status = STATUS_ERROR
                 chain.status = STATUS_ERROR
             else:
-                status = _classify_failure(sale_url, text_found)
+                status = _classify_failure(sale_url, text_found,
+                                           discovery_blocked)
                 chain.status = result.status = status
             chain.status_checked_at = utcnow()
 
