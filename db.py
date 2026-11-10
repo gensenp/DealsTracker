@@ -20,8 +20,10 @@ from urllib.parse import urlparse
 import tldextract
 from sqlalchemy import (
     DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
-    create_engine,
+    and_, case, create_engine, func,
 )
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker,
 )
@@ -239,7 +241,7 @@ class PriceSnapshot(Base):
     scraped_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True)
 
-    @property
+    @hybrid_property
     def discount_pct(self) -> float | None:
         """Percent off, or None when the source didn't give an original price."""
         if not self.original_price or not self.sale_price:
@@ -247,6 +249,27 @@ class PriceSnapshot(Base):
         if self.original_price <= self.sale_price:
             return None
         return round((1 - self.sale_price / self.original_price) * 100)
+
+    @discount_pct.inplace.expression
+    @classmethod
+    def _discount_pct_expression(cls):
+        """The same rule in SQL, so a caller can filter and sort on discount in
+        the database instead of reading every row into Python to do it. The API
+        needs that to paginate `?sort=discount` correctly: the deepest markdown
+        has to be found across all of a chain's products, not just the page of
+        them that happened to be fetched.
+
+        NULL wherever the Python branch returns None -- a missing price, or an
+        "original" that isn't above the sale price -- which keeps those items
+        out of discount ranking rather than ranking them as 0% off, exactly as
+        deals.discount_pct does."""
+        return case(
+            (and_(cls.sale_price.is_not(None),
+                  cls.original_price.is_not(None),
+                  cls.original_price > cls.sale_price),
+             func.round((1 - cls.sale_price / cls.original_price) * 100)),
+            else_=None,
+        )
 
     def __repr__(self) -> str:
         return f"<PriceSnapshot {self.sale_price} was {self.original_price}>"
@@ -333,6 +356,12 @@ def store_details_are_stale(store: Store, now: datetime | None = None) -> bool:
 
 
 # --- Engine / session -------------------------------------------------------
+def _is_memory_sqlite(url: str) -> bool:
+    """True for a SQLite URL with no file behind it, which tests use."""
+    return url.startswith("sqlite") and (
+        url in ("sqlite://", "sqlite:///") or ":memory:" in url)
+
+
 _DEFAULT_SQLITE = "sqlite:///" + os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "dealstracker.db")
 
@@ -366,6 +395,14 @@ def get_engine():
     if url.startswith("sqlite"):
         # Streamlit touches the DB from more than one thread.
         kwargs["connect_args"] = {"check_same_thread": False}
+        if _is_memory_sqlite(url):
+            # An in-memory database lives inside its connection, and the
+            # default pool hands out one connection per thread -- so a second
+            # thread opens a second, empty database. FastAPI's TestClient runs
+            # the app in a worker thread, which is exactly that case: without
+            # this the API would find no tables at all. StaticPool keeps the
+            # single connection, and with it the single database.
+            kwargs["poolclass"] = StaticPool
     else:
         # Supabase's pooled connection string runs pgbouncer in transaction
         # mode, which cannot carry server-side prepared statements between
@@ -380,6 +417,18 @@ def get_engine():
 def init_db() -> None:
     """Create any missing tables. Safe to call on every startup."""
     Base.metadata.create_all(get_engine())
+
+
+def new_session():
+    """A session whose lifetime the caller manages.
+
+    `session_scope` is the usual way in and the right one for a script or a
+    page render. This exists for a framework that owns the lifetime itself: the
+    API opens one per request and closes it when the response is sent, and it
+    never commits, because reads are all it does.
+    """
+    get_engine()  # ensures _Session exists
+    return _Session()
 
 
 @contextmanager

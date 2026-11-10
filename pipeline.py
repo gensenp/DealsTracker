@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 import DealsTracker as dt
 import db
+from api import queries as api_queries
 from db import (
     Chain, PriceSnapshot, Product, Promotion, ScrapeRun, Store,
     STAGE_CACHED, STAGE_CUSTOM_API,
@@ -189,41 +190,38 @@ def load_cached_deals(session, chain: Chain) -> dict:
     """The most recent scrape's deals, rebuilt from the database.
 
     Takes each product's latest snapshot, and the promotions from the run that
-    produced it, so a cached result matches what the last scrape saw."""
-    last = db.as_utc(chain.last_scraped_at)
-    if last is None:
+    produced it, so a cached result matches what the last scrape saw.
+
+    The queries live in api.queries, which the read-only API shares: this used
+    to run one query per product, and a chain with 200 of them made 200 round
+    trips to Supabase to render one page. Both callers now go through a single
+    window-function query. api.queries imports nothing from here, so there is
+    no cycle -- it reads db directly, the same as this module does."""
+    if chain.last_scraped_at is None:
         return empty_deals()
 
-    items = []
-    products = session.scalars(
-        select(Product).where(Product.chain_id == chain.id)).all()
-    for product in products:
-        snapshot = session.scalar(
-            select(PriceSnapshot)
-            .where(PriceSnapshot.product_id == product.id)
-            .order_by(PriceSnapshot.scraped_at.desc())
-            .limit(1))
-        # Only products seen in the latest scrape, not everything ever listed.
-        if snapshot is None or db.as_utc(snapshot.scraped_at) < last:
-            continue
-        items.append({"name": product.name,
-                      "sale_price": snapshot.sale_price,
-                      "original_price": snapshot.original_price,
-                      "product_url": product.product_url})
-
-    promos = session.scalars(
-        select(Promotion)
-        .where(Promotion.chain_id == chain.id, Promotion.scraped_at >= last)
-        .order_by(Promotion.scraped_at.desc())).all()
-
-    return {"items": items, "promotions": [p.text for p in promos]}
+    items, _total = api_queries.latest_deals(session, chain,
+                                             sort=api_queries.SORT_NAME)
+    return {"items": [{"name": item["name"],
+                       "sale_price": item["sale_price"],
+                       "original_price": item["original_price"],
+                       "product_url": item["product_url"]}
+                      for item in items],
+            "promotions": api_queries.latest_promotions(session, chain)}
 
 
 # --- Scraping ---------------------------------------------------------------
-def _classify_failure(sale_url: str | None, text_found: bool) -> str:
-    """Why a chain produced nothing: no sale page at all, or a wall."""
+def _classify_failure(sale_url: str | None, text_found: bool,
+                     discovery_blocked: bool = False) -> str:
+    """Why a chain produced nothing: no sale page at all, or a wall.
+
+    Discovery finding no sale link used to be read as "no sale page" outright.
+    That is only true when we were shown the shop -- a bot wall has no nav, so
+    it yields no link either, and reporting it as a shop with nothing on sale
+    both misinforms the shopper and caches the wrong answer for a week.
+    """
     if sale_url is None:
-        return STATUS_NO_SALE_PAGE   # discovery ran and found no such link
+        return STATUS_BLOCKED if discovery_blocked else STATUS_NO_SALE_PAGE
     return STATUS_BLOCKED if not text_found else STATUS_NO_SALE_PAGE
 
 
@@ -244,6 +242,7 @@ def scrape_chain(session, chain: Chain, stores: list[dict]) -> ChainResult:
     stage = None
 
     try:
+        discovery_blocked = False
         scraper = dt.custom_scraper_for(website or "")
         if scraper:
             stage = STAGE_CUSTOM_API
@@ -255,7 +254,9 @@ def scrape_chain(session, chain: Chain, stores: list[dict]) -> ChainResult:
             if sale_url_is_trusted(chain):
                 sale_url, stage = chain.sale_url, STAGE_CACHED
             else:
-                sale_url, stage = dt.discover_deals_page(website or "")
+                found = dt.discover_deals_page(website or "")
+                sale_url, stage = found.url, found.stage
+                discovery_blocked = found.blocked
 
             if sale_url:
                 text = dt.page_text(sale_url)
@@ -282,7 +283,8 @@ def scrape_chain(session, chain: Chain, stores: list[dict]) -> ChainResult:
                 result.status = STATUS_ERROR
                 chain.status = STATUS_ERROR
             else:
-                status = _classify_failure(sale_url, text_found)
+                status = _classify_failure(sale_url, text_found,
+                                           discovery_blocked)
                 chain.status = result.status = status
             chain.status_checked_at = utcnow()
 

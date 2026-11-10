@@ -1,4 +1,6 @@
+alembic==1.20.1
 altair==6.2.1
+annotated-doc==0.0.5
 annotated-types==0.7.0
 anyio==4.13.0
 attrs==26.1.0
@@ -13,6 +15,7 @@ colorama==0.4.6
 ddgs==9.14.4
 distro==1.9.0
 fake-useragent==2.2.0
+fastapi==0.136.3
 filelock==4.2.9
 gitdb==4.0.12
 GitPython==3.1.50
@@ -31,6 +34,7 @@ Jinja2==3.1.6
 jsonschema-specifications==2025.9.1
 jsonschema==4.26.0
 lxml==6.1.1
+Mako==1.4.3
 MarkupSafe==3.0.3
 narwhals==2.22.1
 numpy==2.4.6

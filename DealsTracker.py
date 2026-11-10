@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from dataclasses import dataclass
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -16,15 +17,30 @@ import uniqloScraper
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GOOGLE_PLACES_API_KEY = (os.environ.get("GOOGLE_PLACES_API_KEY") or "").strip().strip('"\'')
+# Credentials are read when they are used, not at import. Importing this module
+# must stay free of them: the read-only API serves saved deals out of the
+# database and never scrapes, so it would otherwise refuse to start -- and the
+# offline tests would need a Groq key to exercise code that never calls Groq.
+# The Streamlit app still fails with the same message, at search time rather
+# than at startup.
+def require_key(env_var, where):
+    """The named credential, or a RuntimeError naming where to get one."""
+    key = (os.environ.get(env_var) or "").strip().strip('"\'')
+    if not key:
+        raise RuntimeError(f"{env_var} not set in .env (get one at {where})")
+    return key
 
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not set in .env (get one at console.groq.com)")
-if not GOOGLE_PLACES_API_KEY:
-    raise RuntimeError("GOOGLE_PLACES_API_KEY not set in .env (get one at console.cloud.google.com)")
 
-client = Groq(api_key=GROQ_API_KEY)
+_groq_client = None
+
+
+def groq_client():
+    """The Groq client, built on first use and reused afterwards."""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=require_key("GROQ_API_KEY", "console.groq.com"))
+    return _groq_client
+
 
 LLM_MODEL = "openai/gpt-oss-120b"
 
@@ -87,7 +103,7 @@ def extract_deals(text, url):
         if attempt and "rate_limit_exceeded" in str(last_error):
             time.sleep(2)  # let the per-minute allowance recover
         try:
-            res = client.chat.completions.create(
+            res = groq_client().chat.completions.create(
                 model=LLM_MODEL,
                 temperature=0,  # extraction, not writing -- same page, same rows
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
@@ -125,10 +141,12 @@ def find_clothing_stores(city, state=None, postal_code=None):
     if not location:
         raise ValueError("Enter a city or a ZIP code.")
 
+    places_key = require_key("GOOGLE_PLACES_API_KEY",
+                             "console.cloud.google.com")
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-Api-Key": places_key,
         # places.id and places.location come from the Essentials SKU, which is
         # already covered by the Pro fields below -- no change in billing tier.
         "X-Goog-FieldMask": ("places.id,places.displayName,places.websiteUri,"
@@ -143,7 +161,7 @@ def find_clothing_stores(city, state=None, postal_code=None):
     if not res.ok:
         # Show a fingerprint of the key in use (never the full key) so a
         # mismatched deploy secret is easy to spot.
-        k = GOOGLE_PLACES_API_KEY
+        k = places_key
         raise RuntimeError(f"Places API {res.status_code} (key len={len(k)}, "
                            f"ends ...{k[-4:]}): {res.text}")
     stores = []
@@ -330,9 +348,23 @@ def _find_deal_link_rendered(base_url, timeout_ms=20000):
                 break
     return best, stage
 
+@dataclass
+class Discovery:
+    """What looking for a chain's sale page turned up.
+
+    `blocked` is the reason this is a class rather than the (url, stage) pair
+    it used to be. Finding no sale link means "this shop has no sale section"
+    only if we were shown the shop: a bot wall has no nav to find a link in, so
+    the two outcomes are indistinguishable from the URL alone, and the caller
+    needs to be told which it was.
+    """
+    url: str | None = None
+    stage: str | None = None
+    blocked: bool = False
+
+
 def discover_deals_page(base_url):
-    """Find a store's sale/deals page, as (url, stage) -- stage naming which
-    tier of the escalation found it, which the scrape log records.
+    """Find a store's sale/deals page, as a Discovery.
 
     Starts from whatever URL Places gave us, often a store-locator page rather
     than a homepage. Tries a plain fetch first, then a rendered one, because big
@@ -348,15 +380,27 @@ def discover_deals_page(base_url):
 
     best = _best_deal_link(html, base_url) if html else None
     if best:
-        return best, STAGE_FETCH
+        return Discovery(best, STAGE_FETCH)
+
+    # No link in the markup. Before concluding the shop has no sale section,
+    # check whether we were looking at the shop at all -- loft.com answers its
+    # homepage with a PerimeterX wall, served as HTTP 200, which has no nav and
+    # so yields no candidate however hard it is parsed.
+    walled = looks_blocked(visible_text(html))
+
+    # A wall still gets the rendered attempt: some are shown only to clients
+    # that do not look like browsers, and a real nav may appear.
     try:
-        return _find_deal_link_rendered(base_url)
+        rendered, stage = _find_deal_link_rendered(base_url)
     except Exception:
-        return None, None
+        return Discovery(None, None, blocked=walled)
+    if rendered:
+        return Discovery(rendered, stage)
+    return Discovery(None, stage, blocked=walled)
 
 def find_deals_page(base_url):
     """The discovered sale page URL, or None."""
-    return discover_deals_page(base_url)[0]
+    return discover_deals_page(base_url).url
 
 def render_html(url, timeout_ms=45000):
     """Rendered DOM of a page, once its JavaScript has built the nav."""
@@ -377,6 +421,47 @@ def render_text(url, timeout_ms=45000):
         page.wait_for_timeout(1500)
         return page.inner_text("body")
 
+# Wording that means "you are being turned away", found in a page's visible
+# text. A bot wall used to be obvious -- an HTTP error, or a body with nothing
+# in it -- and the length checks in page_text caught both. PerimeterX and
+# DataDome serve theirs as HTTP 200 with a few hundred characters of polite
+# prose, which passes every length check and reads to the extractor as a page
+# that simply has no sale on. loft.com answers this way.
+BLOCK_MARKERS = (
+    "access denied", "access to this page has been denied", "forbidden",
+    "request blocked", "are you a human", "verify you are a human",
+    "unusual traffic", "enable javascript", "enable js", "bot detection",
+    "automation tools", "pardon our interruption", "disable any ad blocker",
+    "perimeterx", "datadome", "captcha",
+)
+
+# Only short pages are judged on wording. A wall is a sentence or two; a real
+# catalogue page runs to thousands of characters, and a shop whose help text
+# mentions a captcha should not be written off as unreachable.
+WALL_MAX_CHARS = 2000
+
+
+def looks_blocked(text):
+    """True if this reads like a bot wall rather than a page of the shop."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) > WALL_MAX_CHARS:
+        return False
+    lowered = stripped.lower()
+    return any(marker in lowered for marker in BLOCK_MARKERS)
+
+
+def visible_text(html):
+    """Readable text of an HTML document, with the furniture stripped out."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
+
+
 def page_text(url):
     """Readable text of a page: plain fetch first, browser if that gives a
     shell. Returns "" when nothing readable came back (bot wall, dead page)."""
@@ -384,15 +469,19 @@ def page_text(url):
     try:
         res = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=10)
         if res.ok:
-            soup = BeautifulSoup(res.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                tag.decompose()
-            text = soup.get_text(separator=" ", strip=True)
+            text = visible_text(res.text)
     except requests.RequestException:
         pass
-    # Blank shell (JS-rendered) or blocked -> render in a real browser.
-    if len(text) < 200:
+    # Blank shell (JS-rendered) or blocked -> render in a real browser. A wall
+    # is worth one rendered attempt: some are served only to clients that do
+    # not look like browsers.
+    if len(text) < 200 or looks_blocked(text):
         text = render_text(url)
+    # A wall that survived the browser is a wall. Reporting nothing readable is
+    # what pipeline already classifies as blocked rather than "no sale page",
+    # and it saves an LLM call on prose that has no prices in it.
+    if looks_blocked(text):
+        return ""
     return text if len(text.strip()) >= 50 else ""
 
 

@@ -9,6 +9,9 @@ import pytest
 
 import db
 import pipeline
+# Captured before the FakeScraper fixture replaces dt.page_text, so one test
+# below can put the real implementation back and drive it end to end.
+from DealsTracker import page_text as real_page_text
 from db import (
     Chain, PriceSnapshot, Product, Promotion, ScrapeRun, Store,
     STAGE_CACHED, STAGE_FETCH,
@@ -72,10 +75,12 @@ class TestChainDisplayName:
 class FakeScraper:
     """Stands in for the network, and counts how often it was asked to work."""
 
-    def __init__(self, deals=None, sale_url="https://x.com/sale", text="page text"):
+    def __init__(self, deals=None, sale_url="https://x.com/sale", text="page text",
+                 blocked=False):
         self.deals = deals if deals is not None else some_deals()
         self.sale_url = sale_url
         self.text = text
+        self.blocked = blocked      # discovery met a wall instead of a shop
         self.discovery_calls = 0
         self.page_calls = 0
         self.extract_calls = 0
@@ -87,7 +92,8 @@ class FakeScraper:
 
         def discover(url):
             self.discovery_calls += 1
-            return self.sale_url, STAGE_FETCH
+            return pipeline.dt.Discovery(self.sale_url, STAGE_FETCH,
+                                         blocked=self.blocked)
 
         def page_text(url):
             self.page_calls += 1
@@ -214,6 +220,45 @@ class TestNegativeCaching:
         result = pipeline.search_deals("Boston", "MA")
         assert result.chains[0].status == STATUS_BLOCKED
 
+    def test_a_walled_homepage_is_blocked_not_no_sale_page(self, memory_db, fake):
+        """Discovery finding no link means "no sale section" only if we were
+        shown the shop. A wall has no nav, so it yields no link either."""
+        fake.sale_url = None
+        fake.blocked = True
+        result = pipeline.search_deals("Boston", "MA")
+        assert result.chains[0].status == STATUS_BLOCKED
+
+    def test_no_link_on_a_real_homepage_is_still_no_sale_page(self, memory_db,
+                                                              fake):
+        """The other half of the same decision: Primark genuinely has none."""
+        fake.sale_url = None
+        fake.blocked = False
+        result = pipeline.search_deals("Boston", "MA")
+        assert result.chains[0].status == STATUS_NO_SALE_PAGE
+
+    def test_a_wall_served_as_http_200_is_blocked_not_no_sale_page(
+            self, memory_db, fake, monkeypatch):
+        """End to end, with the real page_text: loft.com answers 200 with a few
+        hundred characters of PerimeterX prose. That cleared every length check,
+        so the chain used to be filed as having no sale section at all."""
+        wall = ("Access to this page has been denied. You have been blocked "
+                "because we believe you are using automation tools to browse "
+                "the website. Reference ID: a3f29c81-4e7b-11ef-9c2d")
+
+        class Response:
+            ok = True
+            text = f"<html><body>{wall}</body></html>"
+
+        monkeypatch.setattr(pipeline.dt, "page_text", real_page_text)
+        monkeypatch.setattr(pipeline.dt.requests, "get",
+                            lambda url, **kwargs: Response())
+        monkeypatch.setattr(pipeline.dt, "render_text", lambda url, **kw: wall)
+
+        result = pipeline.search_deals("Boston", "MA")
+        assert result.chains[0].status == STATUS_BLOCKED
+        assert fake.extract_calls == 0, (
+            "a wall should not cost an LLM call -- there are no prices in it")
+
     def test_dead_end_is_skipped_until_the_recheck_window_passes(self, memory_db, fake):
         fake.sale_url = None
         pipeline.search_deals("Boston", "MA")
@@ -315,6 +360,21 @@ class TestPersistence:
     def test_cached_deals_exclude_products_from_older_scrapes(self, memory_db, fake):
         """An item that has left the sale shouldn't reappear from history."""
         pipeline.search_deals("Boston", "MA")
+
+        # Push that scrape into the past before re-scraping. Everything here is
+        # stubbed, so two searches finish well inside one tick of the clock --
+        # about a millisecond on Windows -- and the older scrape would
+        # otherwise carry the same timestamp as the newer one, leaving no way
+        # for either this code or the assertion to tell them apart. Real
+        # scrapes are hours apart; see DEALS_FRESH_FOR.
+        earlier = utcnow() - timedelta(hours=1)
+        with db.session_scope() as s:
+            for snapshot in s.query(PriceSnapshot).all():
+                snapshot.scraped_at = earlier
+            for promotion in s.query(Promotion).all():
+                promotion.scraped_at = earlier
+            s.query(Chain).one().last_scraped_at = earlier
+
         fake.deals = {"items": [{"name": "Item 0", "sale_price": 9.0,
                                  "original_price": 40.0}], "promotions": []}
         pipeline.search_deals("Boston", "MA", force_keys={"example.com"})
