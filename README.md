@@ -238,7 +238,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-195 tests, no network and no API keys needed — scraping is stubbed and the
+216 tests, no network and no API keys needed — scraping is stubbed and the
 database is in-memory SQLite. UI tests run the real page headless through
 streamlit's `AppTest`, and the API tests go through FastAPI's `TestClient`
 against that same in-memory database.

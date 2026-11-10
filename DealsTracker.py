@@ -394,6 +394,37 @@ def render_text(url, timeout_ms=45000):
         page.wait_for_timeout(1500)
         return page.inner_text("body")
 
+# Wording that means "you are being turned away", found in a page's visible
+# text. A bot wall used to be obvious -- an HTTP error, or a body with nothing
+# in it -- and the length checks in page_text caught both. PerimeterX and
+# DataDome serve theirs as HTTP 200 with a few hundred characters of polite
+# prose, which passes every length check and reads to the extractor as a page
+# that simply has no sale on. loft.com answers this way.
+BLOCK_MARKERS = (
+    "access denied", "access to this page has been denied", "forbidden",
+    "request blocked", "are you a human", "verify you are a human",
+    "unusual traffic", "enable javascript", "enable js", "bot detection",
+    "automation tools", "pardon our interruption", "disable any ad blocker",
+    "perimeterx", "datadome", "captcha",
+)
+
+# Only short pages are judged on wording. A wall is a sentence or two; a real
+# catalogue page runs to thousands of characters, and a shop whose help text
+# mentions a captcha should not be written off as unreachable.
+WALL_MAX_CHARS = 2000
+
+
+def looks_blocked(text):
+    """True if this reads like a bot wall rather than a page of the shop."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) > WALL_MAX_CHARS:
+        return False
+    lowered = stripped.lower()
+    return any(marker in lowered for marker in BLOCK_MARKERS)
+
+
 def page_text(url):
     """Readable text of a page: plain fetch first, browser if that gives a
     shell. Returns "" when nothing readable came back (bot wall, dead page)."""
@@ -407,9 +438,16 @@ def page_text(url):
             text = soup.get_text(separator=" ", strip=True)
     except requests.RequestException:
         pass
-    # Blank shell (JS-rendered) or blocked -> render in a real browser.
-    if len(text) < 200:
+    # Blank shell (JS-rendered) or blocked -> render in a real browser. A wall
+    # is worth one rendered attempt: some are served only to clients that do
+    # not look like browsers.
+    if len(text) < 200 or looks_blocked(text):
         text = render_text(url)
+    # A wall that survived the browser is a wall. Reporting nothing readable is
+    # what pipeline already classifies as blocked rather than "no sale page",
+    # and it saves an LLM call on prose that has no prices in it.
+    if looks_blocked(text):
+        return ""
     return text if len(text.strip()) >= 50 else ""
 
 

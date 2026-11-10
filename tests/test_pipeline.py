@@ -9,6 +9,9 @@ import pytest
 
 import db
 import pipeline
+# Captured before the FakeScraper fixture replaces dt.page_text, so one test
+# below can put the real implementation back and drive it end to end.
+from DealsTracker import page_text as real_page_text
 from db import (
     Chain, PriceSnapshot, Product, Promotion, ScrapeRun, Store,
     STAGE_CACHED, STAGE_FETCH,
@@ -213,6 +216,29 @@ class TestNegativeCaching:
         fake.text = ""              # rendered, but nothing readable (bot wall)
         result = pipeline.search_deals("Boston", "MA")
         assert result.chains[0].status == STATUS_BLOCKED
+
+    def test_a_wall_served_as_http_200_is_blocked_not_no_sale_page(
+            self, memory_db, fake, monkeypatch):
+        """End to end, with the real page_text: loft.com answers 200 with a few
+        hundred characters of PerimeterX prose. That cleared every length check,
+        so the chain used to be filed as having no sale section at all."""
+        wall = ("Access to this page has been denied. You have been blocked "
+                "because we believe you are using automation tools to browse "
+                "the website. Reference ID: a3f29c81-4e7b-11ef-9c2d")
+
+        class Response:
+            ok = True
+            text = f"<html><body>{wall}</body></html>"
+
+        monkeypatch.setattr(pipeline.dt, "page_text", real_page_text)
+        monkeypatch.setattr(pipeline.dt.requests, "get",
+                            lambda url, **kwargs: Response())
+        monkeypatch.setattr(pipeline.dt, "render_text", lambda url, **kw: wall)
+
+        result = pipeline.search_deals("Boston", "MA")
+        assert result.chains[0].status == STATUS_BLOCKED
+        assert fake.extract_calls == 0, (
+            "a wall should not cost an LLM call -- there are no prices in it")
 
     def test_dead_end_is_skipped_until_the_recheck_window_passes(self, memory_db, fake):
         fake.sale_url = None
