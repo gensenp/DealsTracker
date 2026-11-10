@@ -116,3 +116,57 @@ def test_migrations_do_not_need_a_url_in_alembic_ini(alembic_config):
             if line.strip().startswith("sqlalchemy.url")]
     assert not live, f"alembic.ini should not set a URL, found: {live}"
     assert os.environ.get("DATABASE_URL"), "the fixture should have set one"
+
+
+class TestConnectionStrings:
+    """What env.py does to a Supabase URL on its way into Alembic.
+
+    Supabase hands out `postgres://`-style URLs and tells you to percent-encode
+    special characters in the password. Both of those have to survive the trip
+    through ConfigParser, which reads `%` as interpolation of its own -- so
+    env.py doubles them, and this is the proof that the two escapes cancel
+    rather than compound.
+    """
+
+    def _through_env_py(self, url, monkeypatch):
+        """The two lines migrations/env.py runs, in isolation."""
+        monkeypatch.setenv("DATABASE_URL", url)
+        config = Config(str(PROJECT_ROOT / "alembic.ini"))
+        config.set_main_option("sqlalchemy.url",
+                               db_module.get_database_url().replace("%", "%%"))
+        return config.get_main_option("sqlalchemy.url")
+
+    def test_a_percent_encoded_password_arrives_intact(self, monkeypatch):
+        from sqlalchemy.engine import make_url
+
+        # p@ss%word/50% as Supabase requires it to be written.
+        url = ("postgresql://postgres:p%40ss%25word%2F50%25"
+               "@db.example.supabase.co:5432/postgres")
+        resolved = self._through_env_py(url, monkeypatch)
+
+        assert "%%" not in resolved, "ConfigParser escaping must not leak through"
+        assert make_url(resolved).password == "p@ss%word/50%"
+        db_module.reset_engine_for_testing(None)
+
+    @pytest.mark.parametrize("prefix", ["postgres://", "postgresql://"])
+    def test_supabase_urls_are_rewritten_to_psycopg(self, prefix, monkeypatch):
+        """Both forms Supabase and Heroku hand out, since psycopg 3 is the
+        driver this project depends on and neither prefix selects it."""
+        from sqlalchemy.engine import make_url
+
+        url = f"{prefix}postgres:secret@db.example.supabase.co:5432/postgres"
+        resolved = self._through_env_py(url, monkeypatch)
+
+        assert make_url(resolved).drivername == "postgresql+psycopg"
+        db_module.reset_engine_for_testing(None)
+
+    def test_the_port_is_preserved(self, monkeypatch):
+        """Migrations use the direct connection on 5432, the app uses the
+        pooler on 6543; nothing in the rewrite may quietly change which."""
+        from sqlalchemy.engine import make_url
+
+        for port in (5432, 6543):
+            url = f"postgresql://postgres:secret@db.example.supabase.co:{port}/postgres"
+            resolved = self._through_env_py(url, monkeypatch)
+            assert make_url(resolved).port == port
+        db_module.reset_engine_for_testing(None)

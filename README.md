@@ -86,9 +86,38 @@ the first `CREATE TABLE`, because the tables are already there. Do this once.
 DATABASE_URL="postgresql://..." alembic upgrade head
 ```
 
-**Afterwards**, apply pending migrations with the same `upgrade head`. Use the
-pooled Supabase connection string (port 6543), the same one the app uses. To
-see what would run without running it:
+**Afterwards**, apply pending migrations with the same `upgrade head`.
+
+#### Which connection string
+
+Supabase gives out two, and migrations and the app want different ones.
+
+| | Host | Port | Used by |
+|---|---|---|---|
+| **Direct** | `db.PROJECT.supabase.co` | 5432 | Alembic |
+| **Pooled** | `aws-0-REGION.pooler.supabase.com` | 6543 | The app (`DATABASE_URL`) |
+
+Run migrations over the **direct** connection. The pooled one is pgbouncer in
+transaction mode, which hands a different backend connection to each statement
+— fine for the app's short reads, and the wrong footing for a migration that
+expects its DDL to share one session and one transaction.
+
+The app keeps using the **pooled** one: many short-lived queries is what a
+pooler is for, and `db.py` already disables prepared statements, which
+transaction mode cannot carry between statements.
+
+If a password contains `@`, `/`, `%`, `:` or `#`, percent-encode it — `@`
+becomes `%40`. `migrations/env.py` doubles any `%` on the way into Alembic,
+because ConfigParser reads it as interpolation of its own; the two escapes
+cancel out, and `tests/test_migrations.py` holds that down.
+
+If the direct connection times out, it is probably IPv6. Supabase serves
+`db.PROJECT.supabase.co` over IPv6 only unless the IPv4 add-on is enabled, so a
+network without IPv6 cannot reach it. Use the session pooler (port 5432 on the
+`pooler.supabase.com` host) instead — session mode keeps one backend
+connection, which is what a migration needs.
+
+To see what would run without running it:
 
 ```bash
 alembic upgrade head --sql      # prints the SQL, touches nothing
@@ -313,7 +342,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-267 tests, no network and no API keys needed — scraping is stubbed and the
+271 tests, no network and no API keys needed — scraping is stubbed and the
 database is in-memory SQLite. UI tests run the real page headless through
 streamlit's `AppTest`, and the API tests go through FastAPI's `TestClient`
 against that same in-memory database.
